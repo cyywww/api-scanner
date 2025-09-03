@@ -15,7 +15,7 @@ export class ScanController {
     return this.scanService.scanForXSS(url);
   }
 
-  @Post('sqli')
+  @Post('sql')
   async scanSQLi(@Body('url') url: string): Promise<ScanSQLInjectionResult[]> {
     return this.sqliService.scanForSQLi(url);
   }

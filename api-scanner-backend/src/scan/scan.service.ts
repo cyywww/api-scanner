@@ -24,7 +24,6 @@ export class ScanXSSService {
 
         results.push({ payload, vulnerable });
       } catch (err: unknown) {
-        // TypeScript 默认 err 是 unknown，所以要缩小类型范围
         if (err instanceof Error) {
           results.push({ payload, vulnerable: false, error: err.message });
         } else {
@@ -40,7 +39,7 @@ export class ScanXSSService {
 @Injectable()
 export class ScanSQLiService {
   async scanForSQLi(url: string): Promise<ScanSQLInjectionResult[]> {
-    // 常见的 SQLi payload
+    // Common SQLi payloads
     const payloads: string[] = [
       `' OR '1'='1`,
       `" OR "1"="1`,
@@ -55,7 +54,7 @@ export class ScanSQLiService {
         const target = `${url}?id=${encodeURIComponent(payload)}`;
         const res = await axios.get<string>(target, { timeout: 5000 });
 
-        // 简单检测逻辑：如果返回内容包含典型 SQL 错误信息，则认为可能存在 SQLi
+        // Simple detection logic: if the response contains typical SQL error messages, it is considered that SQLi may exist.
         const errorPatterns = [
           'SQL syntax',
           'mysql_fetch',
