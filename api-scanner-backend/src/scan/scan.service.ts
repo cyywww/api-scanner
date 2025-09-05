@@ -98,8 +98,8 @@ export class ScanXSSService {
   private async runPythonXSSScanner(url: string): Promise<ScanXSSResult[]> {
     return new Promise<ScanXSSResult[]>((resolve) => {
       const pythonScriptPath = path.join(
-        process.cwd(),
-        'scripts',
+        __dirname,
+        '../scripts',
         'xss_scanner.py',
       );
       const pythonProcess: ChildProcess = spawn('python3', [
@@ -402,8 +402,8 @@ export class ScanSQLiService {
   ): Promise<ScanSQLInjectionResult[]> {
     return new Promise<ScanSQLInjectionResult[]>((resolve) => {
       const pythonScriptPath = path.join(
-        process.cwd(),
-        'scripts',
+        __dirname,
+        '../scripts',
         'sql_scanner.py',
       );
       const pythonProcess: ChildProcess = spawn('python3', [
