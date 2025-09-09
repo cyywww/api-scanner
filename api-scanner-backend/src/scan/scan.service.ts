@@ -1,16 +1,27 @@
-// scan.service.ts - 完全无错误版本
+// scan.service.ts - 改进版本
 import { Injectable, Logger } from '@nestjs/common';
 import { spawn, ChildProcess } from 'child_process';
 import * as path from 'path';
 import axios from 'axios';
+import * as cheerio from 'cheerio';
 import { ScanXSSResult } from '../dto/XSS.dto';
 import { ScanSQLInjectionResult } from '../dto/SQLInjection.dto';
 
-// 严格类型定义
+type ScanMethod =
+  | 'static'
+  | 'dynamic'
+  | 'python'
+  | 'form_post'
+  | 'form_get'
+  | 'url_parameter'
+  | 'selenium_dynamic';
+
 interface AxiosRequestConfig {
   timeout: number;
   maxRedirects?: number;
   headers?: Record<string, string>;
+  maxContentLength?: number;
+  maxBodyLength?: number;
 }
 
 interface ProcessData {
@@ -25,6 +36,16 @@ interface ParsedResult {
   error?: string;
 }
 
+interface PageForm {
+  action: string;
+  method: string;
+  inputs: Array<{
+    name: string;
+    type: string;
+    value?: string;
+  }>;
+}
+
 @Injectable()
 export class ScanXSSService {
   private readonly logger = new Logger(ScanXSSService.name);
@@ -32,18 +53,118 @@ export class ScanXSSService {
   async scanForXSS(url: string): Promise<ScanXSSResult[]> {
     const results: ScanXSSResult[] = [];
 
-    // 1. 静态扫描
-    const staticResults = await this.staticXSSCheck(url);
-    results.push(...staticResults);
+    try {
+      // 1. 分析页面，获取实际的参数和表单
+      const pageInfo = await this.analyzePage(url);
 
-    // 2. Python 脚本扫描
-    const pythonResults = await this.runPythonXSSScanner(url);
-    results.push(...pythonResults);
+      // 2. 基于实际参数的静态扫描
+      const staticResults = await this.staticXSSCheck(url, pageInfo);
+      results.push(...staticResults);
+
+      // 3. Python 脚本扫描（传递参数信息）
+      const pythonResults = await this.runPythonXSSScanner(url, pageInfo);
+      results.push(...pythonResults);
+    } catch (error) {
+      this.logger.error('XSS scan failed:', error);
+    }
 
     return results;
   }
 
-  private async staticXSSCheck(url: string): Promise<ScanXSSResult[]> {
+  private async analyzePage(url: string): Promise<{
+    urlParams: string[];
+    forms: PageForm[];
+  }> {
+    const urlParams: string[] = [];
+    const forms: PageForm[] = [];
+
+    try {
+      // 从URL中提取参数
+      const urlObj = new URL(url);
+      urlObj.searchParams.forEach((_, key) => {
+        urlParams.push(key);
+      });
+
+      // 获取页面内容
+      const response = await axios.get(url, {
+        timeout: 10000,
+        headers: {
+          'User-Agent': 'SecurityScanner/1.0',
+        },
+      });
+
+      // 使用 cheerio 解析HTML
+      const $ = cheerio.load(response.data as string);
+
+      // 查找所有表单
+      $('form').each((_, form) => {
+        const $form = $(form);
+        const formInfo: PageForm = {
+          action: $form.attr('action') || '',
+          method: ($form.attr('method') || 'GET').toUpperCase(),
+          inputs: [],
+        };
+
+        // 查找所有输入字段
+        $form.find('input, textarea, select').each((_, input) => {
+          const $input = $(input);
+          const name = $input.attr('name');
+          const type = $input.attr('type') || 'text';
+
+          if (name && type !== 'submit' && type !== 'button') {
+            formInfo.inputs.push({
+              name,
+              type,
+              value: $input.attr('value'),
+            });
+          }
+        });
+
+        if (formInfo.inputs.length > 0) {
+          forms.push(formInfo);
+        }
+      });
+
+      // 查找URL中的链接，提取参数名
+      $('a[href]').each((_, link) => {
+        const href = $(link).attr('href');
+        if (href && href.includes('?')) {
+          try {
+            const linkUrl = new URL(href, url);
+            linkUrl.searchParams.forEach((_, key) => {
+              if (!urlParams.includes(key)) {
+                urlParams.push(key);
+              }
+            });
+          } catch {
+            // Ignore invalid URLs in href attributes
+          }
+        }
+      });
+    } catch (error) {
+      this.logger.warn('Page analysis failed:', error);
+    }
+
+    // 如果没有找到参数，添加DVWA常用参数
+    if (urlParams.length === 0 && forms.length === 0) {
+      // DVWA 特定参数
+      if (url.includes('xss')) {
+        urlParams.push('name', 'txtName', 'mtxMessage');
+      } else if (url.includes('sqli')) {
+        urlParams.push('id', 'Submit');
+      } else {
+        // 通用参数
+        urlParams.push('q', 'search', 'query', 'input', 'data');
+      }
+    }
+
+    return { urlParams, forms };
+  }
+
+  private async staticXSSCheck(
+    url: string,
+    pageInfo: { urlParams: string[]; forms: PageForm[] },
+  ): Promise<ScanXSSResult[]> {
     const payloads: string[] = [
       `<script>alert('XSS')</script>`,
       `javascript:alert('XSS')`,
@@ -55,57 +176,187 @@ export class ScanXSSService {
 
     const results: ScanXSSResult[] = [];
 
-    for (const payload of payloads) {
-      const testUrl = this.buildTestUrl(url, payload);
-      const config: AxiosRequestConfig = {
-        timeout: 10000,
-        maxRedirects: 5,
-        headers: {
-          'User-Agent': 'SecurityScanner/1.0',
-        },
-      };
-
-      try {
-        const response = await axios.get(testUrl, config);
-        const responseData = this.extractStringFromResponse(response);
-        const vulnerable = this.detectXSSInResponse(responseData, payload);
-
-        const result: ScanXSSResult = {
+    // 测试URL参数
+    for (const param of pageInfo.urlParams) {
+      for (const payload of payloads) {
+        const testUrl = this.buildTestUrlWithParam(url, param, payload);
+        const result = await this.testSinglePayload(
+          testUrl,
           payload,
-          vulnerable,
-          method: 'static',
-        };
-
-        if (vulnerable) {
-          result.context = this.extractContext(responseData, payload);
-        }
-
+          param,
+          'url_parameter',
+        );
         results.push(result);
-      } catch (err) {
-        const errorResult: ScanXSSResult = {
-          payload,
-          vulnerable: false,
-          method: 'static',
-          error: this.extractErrorMessage(err),
-        };
-        results.push(errorResult);
+      }
+    }
+
+    // 测试表单
+    for (const form of pageInfo.forms) {
+      for (const input of form.inputs) {
+        for (const payload of payloads.slice(0, 3)) {
+          // 限制表单测试数量
+          const result = await this.testFormPayload(
+            url,
+            form,
+            input.name,
+            payload,
+          );
+          results.push(result);
+        }
       }
     }
 
     return results;
   }
 
-  private async runPythonXSSScanner(url: string): Promise<ScanXSSResult[]> {
+  private async testSinglePayload(
+    testUrl: string,
+    payload: string,
+    parameter: string,
+    method: string,
+  ): Promise<ScanXSSResult> {
+    const config: AxiosRequestConfig = {
+      timeout: 10000,
+      maxRedirects: 5,
+      headers: {
+        'User-Agent': 'SecurityScanner/1.0',
+      },
+      maxContentLength: 50 * 1024 * 1024, // 50MB
+      maxBodyLength: 50 * 1024 * 1024,
+    };
+
+    try {
+      const response = await axios.get(testUrl, config);
+      const responseData = this.extractStringFromResponse(response);
+      const vulnerable = this.detectXSSInResponse(responseData, payload);
+
+      const result: ScanXSSResult = {
+        payload,
+        vulnerable,
+        method: method as ScanMethod,
+        parameter,
+        url: testUrl,
+      };
+
+      if (vulnerable) {
+        result.context = this.extractContext(responseData, payload);
+        result.confidence = 90;
+        result.severity = 'high';
+      }
+
+      return result;
+    } catch (err) {
+      return {
+        payload,
+        vulnerable: false,
+        method: method as ScanMethod,
+        parameter,
+        error: this.extractErrorMessage(err),
+      };
+    }
+  }
+
+  private async testFormPayload(
+    baseUrl: string,
+    form: PageForm,
+    fieldName: string,
+    payload: string,
+  ): Promise<ScanXSSResult> {
+    try {
+      const formUrl = this.resolveUrl(baseUrl, form.action);
+      const formData: Record<string, string> = {};
+
+      // 填充表单数据
+      form.inputs.forEach((input) => {
+        if (input.name === fieldName) {
+          formData[input.name] = payload;
+        } else {
+          formData[input.name] = input.value || 'test';
+        }
+      });
+
+      const config: AxiosRequestConfig = {
+        timeout: 10000,
+        headers: {
+          'User-Agent': 'SecurityScanner/1.0',
+        },
+      };
+
+      let response;
+      if (form.method === 'POST') {
+        response = await axios.post(formUrl, formData, config);
+      } else {
+        response = await axios.get(formUrl, { ...config, params: formData });
+      }
+
+      const responseData = this.extractStringFromResponse(response);
+      const vulnerable = this.detectXSSInResponse(responseData, payload);
+
+      return {
+        payload,
+        vulnerable,
+        method: `form_${form.method.toLowerCase()}` as 'form_get' | 'form_post',
+        field: fieldName,
+        url: formUrl,
+        context: vulnerable
+          ? this.extractContext(responseData, payload)
+          : undefined,
+      };
+    } catch (err) {
+      return {
+        payload,
+        vulnerable: false,
+        method: 'form_post',
+        field: fieldName,
+        error: this.extractErrorMessage(err),
+      };
+    }
+  }
+
+  private buildTestUrlWithParam(
+    baseUrl: string,
+    param: string,
+    payload: string,
+  ): string {
+    const url = new URL(baseUrl);
+    url.searchParams.set(param, payload);
+    return url.toString();
+  }
+
+  private resolveUrl(baseUrl: string, relativeUrl: string): string {
+    if (!relativeUrl) return baseUrl;
+    if (relativeUrl.startsWith('http')) return relativeUrl;
+
+    const base = new URL(baseUrl);
+    if (relativeUrl.startsWith('/')) {
+      return `${base.protocol}//${base.host}${relativeUrl}`;
+    }
+
+    const basePath = base.pathname.substring(
+      0,
+      base.pathname.lastIndexOf('/') + 1,
+    );
+    return `${base.protocol}//${base.host}${basePath}${relativeUrl}`;
+  }
+
+  private async runPythonXSSScanner(
+    url: string,
+    pageInfo: { urlParams: string[]; forms: PageForm[] },
+  ): Promise<ScanXSSResult[]> {
     return new Promise<ScanXSSResult[]>((resolve) => {
       const pythonScriptPath = path.join(
         __dirname,
         '../scripts',
         'xss_scanner.py',
       );
-      const pythonProcess: ChildProcess = spawn('python3', [
-        pythonScriptPath,
-        url,
-      ]);
+
+      // 传递参数信息给Python脚本
+      const args = [pythonScriptPath, url];
+      if (pageInfo.urlParams.length > 0) {
+        args.push('--params', pageInfo.urlParams.join(','));
+      }
+
+      const pythonProcess: ChildProcess = spawn('python3', args);
 
       const processData: ProcessData = {
         output: '',
@@ -142,22 +393,7 @@ export class ScanXSSService {
     });
   }
 
-  private buildTestUrl(baseUrl: string, payload: string): string {
-    const url = new URL(baseUrl);
-    const paramNames: string[] = [
-      'q',
-      'search',
-      'query',
-      'input',
-      'data',
-      'test',
-    ];
-    // 修复：移除不必要的类型断言
-    const randomParam =
-      paramNames[Math.floor(Math.random() * paramNames.length)];
-    url.searchParams.set(randomParam, payload);
-    return url.toString();
-  }
+  // ... 其他辅助方法保持不变 ...
 
   private detectXSSInResponse(responseData: string, payload: string): boolean {
     if (responseData.includes(payload)) {
@@ -179,9 +415,7 @@ export class ScanXSSService {
 
   private extractContext(responseData: string, payload: string): string {
     const index = responseData.indexOf(payload);
-    if (index === -1) {
-      return '';
-    }
+    if (index === -1) return '';
 
     const start = Math.max(0, index - 50);
     const end = Math.min(responseData.length, index + payload.length + 50);
@@ -199,7 +433,6 @@ export class ScanXSSService {
       return '';
     }
 
-    // 修复：安全的对象序列化，避免 [object Object] 警告
     if (typeof responseData === 'object') {
       try {
         return JSON.stringify(responseData);
@@ -208,7 +441,6 @@ export class ScanXSSService {
       }
     }
 
-    // 修复：安全的基本类型转换
     if (typeof responseData === 'number' || typeof responseData === 'boolean') {
       return String(responseData);
     }
@@ -267,6 +499,7 @@ export class ScanXSSService {
   }
 }
 
+// SQLi服务类似改进...
 @Injectable()
 export class ScanSQLiService {
   private readonly logger = new Logger(ScanSQLiService.name);
@@ -274,23 +507,103 @@ export class ScanSQLiService {
   async scanForSQLi(url: string): Promise<ScanSQLInjectionResult[]> {
     const results: ScanSQLInjectionResult[] = [];
 
-    // 1. 基于时间的盲注检测
-    const timeBasedResults = await this.timeBasedSQLiCheck(url);
-    results.push(...timeBasedResults);
+    try {
+      // 1. 分析页面，获取实际的参数
+      const pageInfo = await this.analyzePage(url);
 
-    // 2. 错误信息检测
-    const errorBasedResults = await this.errorBasedSQLiCheck(url);
-    results.push(...errorBasedResults);
+      // 2. 基于时间的盲注检测
+      const timeBasedResults = await this.timeBasedSQLiCheck(url, pageInfo);
+      results.push(...timeBasedResults);
 
-    // 3. Python sqlmap 脚本
-    const pythonResults = await this.runPythonSQLScanner(url);
-    results.push(...pythonResults);
+      // 3. 错误信息检测
+      const errorBasedResults = await this.errorBasedSQLiCheck(url, pageInfo);
+      results.push(...errorBasedResults);
+
+      // 4. Python sqlmap 脚本
+      const pythonResults = await this.runPythonSQLScanner(url, pageInfo);
+      results.push(...pythonResults);
+    } catch (error) {
+      this.logger.error('SQLi scan failed:', error);
+    }
 
     return results;
   }
 
+  private async analyzePage(url: string): Promise<{
+    urlParams: string[];
+    forms: PageForm[];
+  }> {
+    const urlParams: string[] = [];
+    const forms: PageForm[] = [];
+
+    try {
+      // 从URL中提取参数
+      const urlObj = new URL(url);
+      urlObj.searchParams.forEach((_, key) => {
+        urlParams.push(key);
+      });
+
+      // 获取页面内容
+      const response = await axios.get(url, {
+        timeout: 10000,
+        headers: {
+          'User-Agent': 'SecurityScanner/1.0',
+        },
+      });
+
+      // 使用 cheerio 解析HTML
+      const $ = cheerio.load(response.data as string);
+
+      // 查找所有表单
+      $('form').each((_, form) => {
+        const $form = $(form);
+        const formInfo: PageForm = {
+          action: $form.attr('action') || '',
+          method: ($form.attr('method') || 'GET').toUpperCase(),
+          inputs: [],
+        };
+
+        // 查找所有输入字段
+        $form.find('input, textarea, select').each((_, input) => {
+          const $input = $(input);
+          const name = $input.attr('name');
+          const type = $input.attr('type') || 'text';
+
+          if (name && type !== 'submit' && type !== 'button') {
+            formInfo.inputs.push({
+              name,
+              type,
+              value: $input.attr('value'),
+            });
+          }
+        });
+
+        if (formInfo.inputs.length > 0) {
+          forms.push(formInfo);
+        }
+      });
+    } catch (error) {
+      this.logger.warn('Page analysis failed:', error);
+    }
+
+    // 如果没有找到参数，添加DVWA常用参数
+    if (urlParams.length === 0 && forms.length === 0) {
+      if (url.includes('sqli')) {
+        urlParams.push('id', 'Submit');
+      } else if (url.includes('xss')) {
+        urlParams.push('name', 'txtName');
+      } else {
+        // SQL注入常用参数
+        urlParams.push('id', 'user_id', 'product_id', 'page', 'category');
+      }
+    }
+
+    return { urlParams, forms };
+  }
+
   private async timeBasedSQLiCheck(
     url: string,
+    pageInfo: { urlParams: string[]; forms: PageForm[] },
   ): Promise<ScanSQLInjectionResult[]> {
     const timeBasedPayloads: string[] = [
       `1' AND SLEEP(5)--`,
@@ -301,35 +614,43 @@ export class ScanSQLiService {
 
     const results: ScanSQLInjectionResult[] = [];
 
-    for (const payload of timeBasedPayloads) {
-      const testUrl = this.buildTestUrl(url, payload);
+    // 测试每个参数
+    for (const param of pageInfo.urlParams) {
+      for (const payload of timeBasedPayloads) {
+        const testUrl = this.buildTestUrlWithParam(url, param, payload);
 
-      try {
-        const startTime = Date.now();
-        await axios.get(testUrl, { timeout: 10000 });
-        const responseTime = Date.now() - startTime;
-        const vulnerable = responseTime > 4000;
+        try {
+          const startTime = Date.now();
+          await axios.get(testUrl, { timeout: 10000 });
+          const responseTime = Date.now() - startTime;
+          const vulnerable = responseTime > 4000;
 
-        const result: ScanSQLInjectionResult = {
-          payload,
-          vulnerable,
-          method: 'time-based',
-          responseTime,
-        };
+          const result: ScanSQLInjectionResult = {
+            payload,
+            vulnerable,
+            method: 'time-based',
+            responseTime,
+            parameter: param,
+            url: testUrl,
+          };
 
-        if (vulnerable) {
-          result.evidence = `Response time: ${responseTime}ms`;
+          if (vulnerable) {
+            result.evidence = `Response time: ${responseTime}ms`;
+            result.severity = 'high';
+            result.confidence = 85;
+          }
+
+          results.push(result);
+        } catch (err) {
+          const errorResult: ScanSQLInjectionResult = {
+            payload,
+            vulnerable: false,
+            method: 'time-based',
+            parameter: param,
+            error: this.extractErrorMessage(err),
+          };
+          results.push(errorResult);
         }
-
-        results.push(result);
-      } catch (err) {
-        const errorResult: ScanSQLInjectionResult = {
-          payload,
-          vulnerable: false,
-          method: 'time-based',
-          error: this.extractErrorMessage(err),
-        };
-        results.push(errorResult);
       }
     }
 
@@ -338,6 +659,7 @@ export class ScanSQLiService {
 
   private async errorBasedSQLiCheck(
     url: string,
+    pageInfo: { urlParams: string[]; forms: PageForm[] },
   ): Promise<ScanSQLInjectionResult[]> {
     const errorPayloads: string[] = [
       `'`,
@@ -362,43 +684,62 @@ export class ScanSQLiService {
       /database error/i,
     ];
 
-    for (const payload of errorPayloads) {
-      const testUrl = this.buildTestUrl(url, payload);
+    // 测试每个参数
+    for (const param of pageInfo.urlParams) {
+      for (const payload of errorPayloads) {
+        const testUrl = this.buildTestUrlWithParam(url, param, payload);
 
-      try {
-        const response = await axios.get(testUrl, { timeout: 8000 });
-        const responseData = this.extractStringFromResponse(response);
-        const vulnerable = errorPatterns.some((pattern: RegExp) =>
-          pattern.test(responseData),
-        );
+        try {
+          const response = await axios.get(testUrl, { timeout: 8000 });
+          const responseData = this.extractStringFromResponse(response);
+          const vulnerable = errorPatterns.some((pattern: RegExp) =>
+            pattern.test(responseData),
+          );
 
-        const result: ScanSQLInjectionResult = {
-          payload,
-          vulnerable,
-          method: 'error-based',
-        };
+          const result: ScanSQLInjectionResult = {
+            payload,
+            vulnerable,
+            method: 'error-based',
+            parameter: param,
+            url: testUrl,
+          };
 
-        if (vulnerable) {
-          result.evidence = this.extractSQLError(responseData, errorPatterns);
+          if (vulnerable) {
+            result.evidence = this.extractSQLError(responseData, errorPatterns);
+            result.severity = 'critical';
+            result.confidence = 95;
+          }
+
+          results.push(result);
+        } catch (err) {
+          const errorResult: ScanSQLInjectionResult = {
+            payload,
+            vulnerable: false,
+            method: 'error-based',
+            parameter: param,
+            error: this.extractErrorMessage(err),
+          };
+          results.push(errorResult);
         }
-
-        results.push(result);
-      } catch (err) {
-        const errorResult: ScanSQLInjectionResult = {
-          payload,
-          vulnerable: false,
-          method: 'error-based',
-          error: this.extractErrorMessage(err),
-        };
-        results.push(errorResult);
       }
     }
 
     return results;
   }
 
+  private buildTestUrlWithParam(
+    baseUrl: string,
+    param: string,
+    payload: string,
+  ): string {
+    const url = new URL(baseUrl);
+    url.searchParams.set(param, payload);
+    return url.toString();
+  }
+
   private async runPythonSQLScanner(
     url: string,
+    pageInfo: { urlParams: string[]; forms: PageForm[] },
   ): Promise<ScanSQLInjectionResult[]> {
     return new Promise<ScanSQLInjectionResult[]>((resolve) => {
       const pythonScriptPath = path.join(
@@ -406,10 +747,14 @@ export class ScanSQLiService {
         '../scripts',
         'sql_scanner.py',
       );
-      const pythonProcess: ChildProcess = spawn('python3', [
-        pythonScriptPath,
-        url,
-      ]);
+
+      // 传递参数信息给Python脚本
+      const args = [pythonScriptPath, url];
+      if (pageInfo.urlParams.length > 0) {
+        args.push('--params', pageInfo.urlParams.join(','));
+      }
+
+      const pythonProcess: ChildProcess = spawn('python3', args);
 
       const processData: ProcessData = {
         output: '',
@@ -446,22 +791,7 @@ export class ScanSQLiService {
     });
   }
 
-  private buildTestUrl(baseUrl: string, payload: string): string {
-    const url = new URL(baseUrl);
-    const paramNames: string[] = [
-      'id',
-      'user_id',
-      'product_id',
-      'page',
-      'category',
-      'item',
-    ];
-    // 修复：移除不必要的类型断言
-    const randomParam =
-      paramNames[Math.floor(Math.random() * paramNames.length)];
-    url.searchParams.set(randomParam, payload);
-    return url.toString();
-  }
+  // ... 其他辅助方法保持不变 ...
 
   private extractSQLError(responseData: string, patterns: RegExp[]): string {
     for (const pattern of patterns) {
@@ -484,7 +814,6 @@ export class ScanSQLiService {
       return '';
     }
 
-    // 修复：安全的对象序列化，避免 [object Object] 警告
     if (typeof responseData === 'object') {
       try {
         return JSON.stringify(responseData);
@@ -494,9 +823,10 @@ export class ScanSQLiService {
     }
 
     if (typeof responseData === 'number' || typeof responseData === 'boolean') {
-      return String(responseData); // ✅ 只对安全类型调用
+      return String(responseData);
     }
-    return '[Unknown Type]'; // ✅ 其他情况返回明确的字符串
+
+    return '[Unknown Type]';
   }
 
   private extractErrorMessage(err: unknown): string {
