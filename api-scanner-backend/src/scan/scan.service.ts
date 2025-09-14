@@ -345,8 +345,8 @@ export class ScanXSSService {
   ): Promise<ScanXSSResult[]> {
     return new Promise<ScanXSSResult[]>((resolve) => {
       const pythonScriptPath = path.join(
-        __dirname,
-        '../scripts',
+        process.cwd(),
+        'src/scripts',
         'xss_scanner.py',
       );
 
@@ -743,8 +743,8 @@ export class ScanSQLiService {
   ): Promise<ScanSQLInjectionResult[]> {
     return new Promise<ScanSQLInjectionResult[]>((resolve) => {
       const pythonScriptPath = path.join(
-        __dirname,
-        '../scripts',
+        process.cwd(),
+        'src/scripts',
         'sql_scanner.py',
       );
 

