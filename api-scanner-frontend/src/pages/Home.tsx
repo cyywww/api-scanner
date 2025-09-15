@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { scanXSS, scanSQLInjection } from '../services/api';
 import { ResultTable } from '../components/ResultTable';
 
-// 添加结果类型定义
+// Add result type definitions.
 interface ScanResult {
   payload: string;
   vulnerable: boolean;
@@ -22,7 +22,7 @@ interface ScanResult {
 
 export default function Home() {
   const [url, setUrl] = useState('');
-  // 为 state 添加类型
+  // Add type for state
   const [xssResults, setXssResults] = useState<ScanResult[]>([]);
   const [sqlResults, setSqlResults] = useState<ScanResult[]>([]);
   const [xssLoading, setXssLoading] = useState(false);
@@ -31,13 +31,13 @@ export default function Home() {
 
   const handleXSSScan = async () => {
     setXssLoading(true);
-    // 清空所有结果
+    // Clear all results.
     setXssResults([]);
     setSqlResults([]);
     try {
       const data = await scanXSS(url);
       setXssResults(data);
-      setActiveTab('xss');  // 直接切换到 XSS 标签
+      setActiveTab('xss');  // Switch to the XSS tab directly.
     } catch (err) {
       console.error(err);
     } finally {
@@ -47,13 +47,13 @@ export default function Home() {
 
   const handleSQLScan = async () => {
     setSqlLoading(true);
-    // 清空所有结果
+    // Clear all results.
     setSqlResults([]);
     setXssResults([]);
     try {
       const data = await scanSQLInjection(url);
       setSqlResults(data);
-      setActiveTab('sql');  // 直接切换到 SQL 标签
+      setActiveTab('sql');  // Switch to the SQL tab directly.
     } catch (err) {
       console.error(err);
     } finally {
@@ -63,15 +63,15 @@ export default function Home() {
 
   const handleScanAll = async () => {
     setActiveTab('summary');
-    // 设置加载状态
+    // Set loading state.
     setXssLoading(true);
     setSqlLoading(true);
-    // 清空所有结果
+    // Clear all results.
     setXssResults([]);
     setSqlResults([]);
     
     try {
-      // 并行执行两个扫描
+      // Execute two scans in parallel.
       const [xssData, sqlData] = await Promise.all([
         scanXSS(url),
         scanSQLInjection(url)

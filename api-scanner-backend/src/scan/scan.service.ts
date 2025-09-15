@@ -1,4 +1,3 @@
-// scan.service.ts - 改进版本
 import { Injectable, Logger } from '@nestjs/common';
 import { spawn, ChildProcess } from 'child_process';
 import * as path from 'path';
@@ -54,14 +53,14 @@ export class ScanXSSService {
     const results: ScanXSSResult[] = [];
 
     try {
-      // 1. 分析页面，获取实际的参数和表单
+      // 1. Analyze the page to get the actual parameters and forms
       const pageInfo = await this.analyzePage(url);
 
-      // 2. 基于实际参数的静态扫描
+      // 2. Perform a static scan based on the actual parameters
       const staticResults = await this.staticXSSCheck(url, pageInfo);
       results.push(...staticResults);
 
-      // 3. Python 脚本扫描（传递参数信息）
+      // 3. Run a Python script scan (passing parameter information)
       const pythonResults = await this.runPythonXSSScanner(url, pageInfo);
       results.push(...pythonResults);
     } catch (error) {

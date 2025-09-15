@@ -63,9 +63,42 @@ export const ResultTable: React.FC<ResultTableProps> = ({ results, type }) => {
     );
   }
 
+  // Order the results with vulnerable items at the top and safe items at the bottom.
+  const sortedResults = [...results].sort((a, b) => {
+    // First, sort by vulnerable status (true first, false last).
+    if (a.vulnerable !== b.vulnerable) {
+      return a.vulnerable ? -1 : 1;
+    }
+    
+    // If the vulnerable status is the same, sort by severity (highest first).
+    if (a.vulnerable && b.vulnerable) {
+      const severityOrder: { [key: string]: number } = {
+        'critical': 4,
+        'high': 3,
+        'medium': 2,
+        'low': 1
+      };
+      const aSeverity = severityOrder[a.severity || ''] || 0;
+      const bSeverity = severityOrder[b.severity || ''] || 0;
+      if (aSeverity !== bSeverity) {
+        return bSeverity - aSeverity;
+      }
+      
+      // If the severity is also the same, sort by confidence (highest first).
+      const aConfidence = a.confidence || 0;
+      const bConfidence = b.confidence || 0;
+      if (aConfidence !== bConfidence) {
+        return bConfidence - aConfidence;
+      }
+    }
+    
+    // Otherwise, maintain the original order.
+    return 0;
+  });
+
   return (
     <div className="space-y-3">
-      {results.map((result, index) => (
+      {sortedResults.map((result, index) => (
         <div
           key={index}
           className={`border rounded-lg p-4 transition-all duration-200 hover:shadow-md ${
