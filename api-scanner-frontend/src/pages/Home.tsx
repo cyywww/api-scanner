@@ -31,13 +31,13 @@ export default function Home() {
 
   const handleXSSScan = async () => {
     setXssLoading(true);
+    // 清空所有结果
     setXssResults([]);
+    setSqlResults([]);
     try {
       const data = await scanXSS(url);
       setXssResults(data);
-      if (sqlResults.length === 0) {
-        setActiveTab('xss');
-      }
+      setActiveTab('xss');  // 直接切换到 XSS 标签
     } catch (err) {
       console.error(err);
     } finally {
@@ -47,13 +47,13 @@ export default function Home() {
 
   const handleSQLScan = async () => {
     setSqlLoading(true);
+    // 清空所有结果
     setSqlResults([]);
+    setXssResults([]);
     try {
       const data = await scanSQLInjection(url);
       setSqlResults(data);
-      if (xssResults.length === 0) {
-        setActiveTab('sql');
-      }
+      setActiveTab('sql');  // 直接切换到 SQL 标签
     } catch (err) {
       console.error(err);
     } finally {
@@ -63,7 +63,28 @@ export default function Home() {
 
   const handleScanAll = async () => {
     setActiveTab('summary');
-    await Promise.all([handleXSSScan(), handleSQLScan()]);
+    // 设置加载状态
+    setXssLoading(true);
+    setSqlLoading(true);
+    // 清空所有结果
+    setXssResults([]);
+    setSqlResults([]);
+    
+    try {
+      // 并行执行两个扫描
+      const [xssData, sqlData] = await Promise.all([
+        scanXSS(url),
+        scanSQLInjection(url)
+      ]);
+      
+      setXssResults(xssData);
+      setSqlResults(sqlData);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setXssLoading(false);
+      setSqlLoading(false);
+    }
   };
 
   const xssVulnerabilities = xssResults.filter(r => r.vulnerable).length;
