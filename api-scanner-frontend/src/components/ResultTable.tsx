@@ -1,26 +1,5 @@
 import React from "react";
-
-type Result = {
-  payload: string;
-  vulnerable: boolean;
-  method?: string;
-  parameter?: string;
-  field?: string;
-  url?: string;
-  confidence?: number;
-  severity?: string;
-  evidence?: string;
-  error?: string;
-  responseTime?: number;
-  context?: string;
-  databaseType?: string;
-  injectionType?: string;
-};
-
-interface ResultTableProps {
-  results: Result[];
-  type: "xss" | "sql";
-}
+import type { ResultTableProps } from "../types/scan.types";
 
 export const ResultTable: React.FC<ResultTableProps> = ({ results, type }) => {
   const getMethodColor = () => {
@@ -117,7 +96,7 @@ export const ResultTable: React.FC<ResultTableProps> = ({ results, type }) => {
                       : "bg-green-100 text-green-800"
                   }`}
                 >
-                  {result.vulnerable ? "⚠️ Vulnerable" : "✓ Safe"}
+                  {result.vulnerable ? "Vulnerable" : "✓ Safe"}
                 </span>
                 {result.method && (
                   <span

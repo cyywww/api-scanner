@@ -1,28 +1,11 @@
+
 import { useState } from 'react';
 import { scanXSS, scanSQLInjection } from '../services/api';
 import { ResultTable } from '../components/ResultTable';
-
-// Add result type definitions.
-interface ScanResult {
-  payload: string;
-  vulnerable: boolean;
-  method?: string;
-  parameter?: string;
-  field?: string;
-  url?: string;
-  confidence?: number;
-  severity?: string;
-  evidence?: string;
-  error?: string;
-  responseTime?: number;
-  context?: string;
-  databaseType?: string;
-  injectionType?: string;
-}
+import type { ScanResult } from '../types/scan.types';
 
 export default function Home() {
   const [url, setUrl] = useState('');
-  // Add type for state
   const [xssResults, setXssResults] = useState<ScanResult[]>([]);
   const [sqlResults, setSqlResults] = useState<ScanResult[]>([]);
   const [xssLoading, setXssLoading] = useState(false);
@@ -102,9 +85,9 @@ export default function Home() {
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
             </svg>
           </div>
-          <h1 className="text-5xl font-bold text-gray-900 mb-4">Security Scanner</h1>
+          <h1 className="text-5xl font-bold text-gray-900 mb-4">API Scanner</h1>
           <p className="text-gray-600 text-lg max-w-2xl mx-auto">
-            Detect XSS and SQL Injection vulnerabilities in your web applications with comprehensive security testing
+            Detect XSS and SQL Injection vulnerabilities in your web applications
           </p>
         </div>
 

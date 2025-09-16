@@ -1,41 +1,48 @@
-import axios from 'axios'
+import axios from "axios";
+import type { ScanResult, ScanType } from "../types/scan.types";
 
-const BASE_URL = 'http://localhost:3000'; // Address of the backend server
+const BASE_URL = "http://localhost:3000"; // Address of the backend server
 
 // Scan XSS Vulnerabilities
-export const scanXSS = async (url: string) => {
-  const res = await axios.post(`${BASE_URL}/scan/xss`, { url });
+export const scanXSS = async (url: string): Promise<ScanResult[]> => {
+  const res = await axios.post<ScanResult[]>(`${BASE_URL}/scan/xss`, { url });
   return res.data;
 };
 
 // Scan SQL Injection Vulnerabilities
-export const scanSQLInjection = async (url: string) => {
-  const res = await axios.post(`${BASE_URL}/scan/sql`, { url });
+export const scanSQLInjection = async (url: string): Promise<ScanResult[]> => {
+  const res = await axios.post<ScanResult[]>(`${BASE_URL}/scan/sql`, { url });
   return res.data;
 };
 
 // Scan All Vulnerabilities at once
-export const scanAll = async (url: string) => {
+export const scanAll = async (
+  url: string
+): Promise<{
+  xss: ScanResult[];
+  sql: ScanResult[];
+}> => {
   const [xssResult, sqlResult] = await Promise.all([
     scanXSS(url),
-    scanSQLInjection(url)
+    scanSQLInjection(url),
   ]);
-  
+
   return {
     xss: xssResult,
-    sql: sqlResult
+    sql: sqlResult,
   };
 };
 
 // Generic Scanning Function (Extensible to Other Scan Types)
-export const scanVulnerability = async (url: string, scanType: 'xss' | 'sql' | 'all') => {
+export const scanVulnerability = async (
+  url: string,
+  scanType: Exclude<ScanType, "all">
+): Promise<ScanResult[]> => {
   switch (scanType) {
-    case 'xss':
+    case "xss":
       return await scanXSS(url);
-    case 'sql':
+    case "sql":
       return await scanSQLInjection(url);
-    case 'all':
-      return await scanAll(url);
     default:
       throw new Error(`Unsupported scan type: ${scanType}`);
   }
