@@ -923,7 +923,7 @@ export class ScanSQLiService {
               } else {
                 this.logger.warn(
                   'SQLi test request failed (axios):',
-                  err.message ?? String(err),
+                  err.message || 'Unknown axios error',
                 );
               }
             } else {
@@ -1253,16 +1253,6 @@ export class ScanSQLiService {
         resolve([]);
       });
     });
-  }
-
-  private extractSQLError(responseData: string, patterns: RegExp[]): string {
-    for (const pattern of patterns) {
-      const match = responseData.match(pattern);
-      if (match) {
-        return match[0];
-      }
-    }
-    return '';
   }
 
   private extractStringFromResponse(response: { data: unknown }): string {

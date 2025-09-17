@@ -2,7 +2,7 @@
 export const ScannerConfig = {
   xss: {
     // Maximum number of payloads to test per form field
-    maxPayloadsPerField: 3,
+    maxPayloadsPerField: 10000,
     // Whether to check for stored XSS
     checkStoredXSS: true,
     // Delay before checking stored XSS (ms)
