@@ -5,6 +5,7 @@ import axios from 'axios';
 import * as cheerio from 'cheerio';
 import { ScanXSSResult } from '../dto/XSS.dto';
 import { ScanSQLInjectionResult } from '../dto/SQLInjection.dto';
+import { ScannerConfig } from '../config/scanner.config';
 
 type ScanMethod =
   | 'static'
@@ -13,7 +14,8 @@ type ScanMethod =
   | 'form_post'
   | 'form_get'
   | 'url_parameter'
-  | 'selenium_dynamic';
+  | 'selenium_dynamic'
+  | 'stored'; // Added for stored XSS detection
 
 interface AxiosRequestConfig {
   timeout: number;
@@ -45,6 +47,13 @@ interface PageForm {
   }>;
 }
 
+interface SQLErrorDetection {
+  isError: boolean;
+  dbType?: 'mysql' | 'postgresql' | 'mssql' | 'oracle' | 'sqlite' | 'unknown';
+  evidence?: string;
+  confidence?: number;
+}
+
 @Injectable()
 export class ScanXSSService {
   private readonly logger = new Logger(ScanXSSService.name);
@@ -63,6 +72,11 @@ export class ScanXSSService {
       // 3. Run a Python script scan (passing parameter information)
       const pythonResults = await this.runPythonXSSScanner(url, pageInfo);
       results.push(...pythonResults);
+
+      // 4. Deduplicate results if enabled
+      if (ScannerConfig.validation.deduplicateResults) {
+        return this.deduplicateXSSResults(results);
+      }
     } catch (error) {
       this.logger.error('XSS scan failed:', error);
     }
@@ -78,24 +92,24 @@ export class ScanXSSService {
     const forms: PageForm[] = [];
 
     try {
-      // 从URL中提取参数
+      // Extract parameters from URL
       const urlObj = new URL(url);
       urlObj.searchParams.forEach((_, key) => {
         urlParams.push(key);
       });
 
-      // 获取页面内容
+      // Get page content
       const response = await axios.get(url, {
-        timeout: 10000,
+        timeout: ScannerConfig.network.timeout,
         headers: {
           'User-Agent': 'SecurityScanner/1.0',
         },
       });
 
-      // 使用 cheerio 解析HTML
+      // Parse HTML with cheerio
       const $ = cheerio.load(response.data as string);
 
-      // 查找所有表单
+      // Find all forms
       $('form').each((_, form) => {
         const $form = $(form);
         const formInfo: PageForm = {
@@ -104,7 +118,7 @@ export class ScanXSSService {
           inputs: [],
         };
 
-        // 查找所有输入字段
+        // Find all input fields
         $form.find('input, textarea, select').each((_, input) => {
           const $input = $(input);
           const name = $input.attr('name');
@@ -124,7 +138,7 @@ export class ScanXSSService {
         }
       });
 
-      // 查找URL中的链接，提取参数名
+      // Find parameters in links
       $('a[href]').each((_, link) => {
         const href = $(link).attr('href');
         if (href && href.includes('?')) {
@@ -136,7 +150,7 @@ export class ScanXSSService {
               }
             });
           } catch {
-            // Ignore invalid URLs in href attributes
+            // Ignore invalid URLs
           }
         }
       });
@@ -144,15 +158,13 @@ export class ScanXSSService {
       this.logger.warn('Page analysis failed:', error);
     }
 
-    // 如果没有找到参数，添加DVWA常用参数
+    // Add DVWA-specific parameters if none found
     if (urlParams.length === 0 && forms.length === 0) {
-      // DVWA 特定参数
       if (url.includes('xss')) {
         urlParams.push('name', 'txtName', 'mtxMessage');
       } else if (url.includes('sqli')) {
         urlParams.push('id', 'Submit');
       } else {
-        // 通用参数
         urlParams.push('q', 'search', 'query', 'input', 'data');
       }
     }
@@ -175,7 +187,7 @@ export class ScanXSSService {
 
     const results: ScanXSSResult[] = [];
 
-    // 测试URL参数
+    // Test URL parameters
     for (const param of pageInfo.urlParams) {
       for (const payload of payloads) {
         const testUrl = this.buildTestUrlWithParam(url, param, payload);
@@ -189,18 +201,32 @@ export class ScanXSSService {
       }
     }
 
-    // 测试表单
+    // Test forms with improved logic
     for (const form of pageInfo.forms) {
       for (const input of form.inputs) {
-        for (const payload of payloads.slice(0, 3)) {
-          // 限制表单测试数量
-          const result = await this.testFormPayload(
-            url,
-            form,
-            input.name,
-            payload,
-          );
-          results.push(result);
+        const maxPayloads = Math.min(
+          payloads.length,
+          ScannerConfig.xss.maxPayloadsPerField,
+        );
+        for (const payload of payloads.slice(0, maxPayloads)) {
+          // Check if stored XSS testing is enabled
+          if (ScannerConfig.xss.checkStoredXSS) {
+            const result = await this.testStoredXSS(
+              url,
+              form,
+              input.name,
+              payload,
+            );
+            results.push(result);
+          } else {
+            const result = await this.testFormPayload(
+              url,
+              form,
+              input.name,
+              payload,
+            );
+            results.push(result);
+          }
         }
       }
     }
@@ -215,19 +241,19 @@ export class ScanXSSService {
     method: string,
   ): Promise<ScanXSSResult> {
     const config: AxiosRequestConfig = {
-      timeout: 10000,
+      timeout: ScannerConfig.network.timeout,
       maxRedirects: 5,
       headers: {
         'User-Agent': 'SecurityScanner/1.0',
       },
-      maxContentLength: 50 * 1024 * 1024, // 50MB
-      maxBodyLength: 50 * 1024 * 1024,
+      maxContentLength: ScannerConfig.network.maxContentLength,
+      maxBodyLength: ScannerConfig.network.maxContentLength,
     };
 
     try {
       const response = await axios.get(testUrl, config);
       const responseData = this.extractStringFromResponse(response);
-      const vulnerable = this.detectXSSInResponse(responseData, payload);
+      const vulnerable = this.detectXSSInResponse(responseData, payload, false);
 
       const result: ScanXSSResult = {
         payload,
@@ -241,6 +267,7 @@ export class ScanXSSService {
         result.context = this.extractContext(responseData, payload);
         result.confidence = 90;
         result.severity = 'high';
+        result.evidence = this.extractEvidence(responseData, payload);
       }
 
       return result;
@@ -265,7 +292,7 @@ export class ScanXSSService {
       const formUrl = this.resolveUrl(baseUrl, form.action);
       const formData: Record<string, string> = {};
 
-      // 填充表单数据
+      // Fill form data
       form.inputs.forEach((input) => {
         if (input.name === fieldName) {
           formData[input.name] = payload;
@@ -275,7 +302,7 @@ export class ScanXSSService {
       });
 
       const config: AxiosRequestConfig = {
-        timeout: 10000,
+        timeout: ScannerConfig.network.timeout,
         headers: {
           'User-Agent': 'SecurityScanner/1.0',
         },
@@ -289,7 +316,7 @@ export class ScanXSSService {
       }
 
       const responseData = this.extractStringFromResponse(response);
-      const vulnerable = this.detectXSSInResponse(responseData, payload);
+      const vulnerable = this.detectXSSInResponse(responseData, payload, false);
 
       return {
         payload,
@@ -299,6 +326,11 @@ export class ScanXSSService {
         url: formUrl,
         context: vulnerable
           ? this.extractContext(responseData, payload)
+          : undefined,
+        confidence: vulnerable ? 85 : 0,
+        severity: vulnerable ? 'high' : undefined,
+        evidence: vulnerable
+          ? this.extractEvidence(responseData, payload)
           : undefined,
       };
     } catch (err) {
@@ -310,6 +342,238 @@ export class ScanXSSService {
         error: this.extractErrorMessage(err),
       };
     }
+  }
+
+  private async testStoredXSS(
+    baseUrl: string,
+    form: PageForm,
+    fieldName: string,
+    payload: string,
+  ): Promise<ScanXSSResult> {
+    try {
+      const formUrl = this.resolveUrl(baseUrl, form.action);
+      // Create unique identifier for tracking
+      const uniqueId = `XSS_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      const taggedPayload = payload.replace('XSS', uniqueId);
+
+      const formData: Record<string, string> = {};
+      form.inputs.forEach((input) => {
+        if (input.name === fieldName) {
+          formData[input.name] = taggedPayload;
+        } else {
+          formData[input.name] = input.value || 'test';
+        }
+      });
+
+      // 1. Submit payload
+      const config: AxiosRequestConfig = {
+        timeout: ScannerConfig.network.timeout,
+        headers: {
+          'User-Agent': 'SecurityScanner/1.0',
+        },
+      };
+
+      let submitResponse;
+      if (form.method === 'POST') {
+        submitResponse = await axios.post(formUrl, formData, config);
+      } else {
+        submitResponse = await axios.get(formUrl, {
+          ...config,
+          params: formData,
+        });
+      }
+
+      // 2. Check immediate response (reflected XSS)
+      const submitResponseData = this.extractStringFromResponse(submitResponse);
+      let vulnerable = this.detectXSSInResponse(
+        submitResponseData,
+        taggedPayload,
+        false,
+      );
+
+      let detectionMethod: ScanMethod = 'form_post';
+
+      // 3. If not reflected, check for stored XSS
+      if (!vulnerable && ScannerConfig.xss.checkStoredXSS) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, ScannerConfig.xss.storageCheckDelay),
+        );
+
+        // Re-visit the page
+        const viewResponse = await axios.get(baseUrl, config);
+        const viewResponseData = this.extractStringFromResponse(viewResponse);
+        vulnerable = this.detectXSSInResponse(
+          viewResponseData,
+          taggedPayload,
+          true,
+        );
+
+        if (vulnerable) {
+          detectionMethod = 'stored';
+        }
+
+        // Check other common display pages
+        if (!vulnerable) {
+          for (const page of ScannerConfig.xss.storedXSSPages) {
+            try {
+              const pageUrl = new URL(page, baseUrl).toString();
+              const pageResponse = await axios.get(pageUrl, config);
+              const pageData = this.extractStringFromResponse(pageResponse);
+              if (pageData.includes(uniqueId)) {
+                vulnerable = true;
+                detectionMethod = 'stored';
+                break;
+              }
+            } catch {
+              // Ignore pages that don't exist
+            }
+          }
+        }
+      }
+
+      return {
+        payload: taggedPayload,
+        vulnerable,
+        method: detectionMethod,
+        field: fieldName,
+        url: formUrl,
+        confidence: vulnerable ? 85 : 0,
+        severity: vulnerable
+          ? detectionMethod === 'stored'
+            ? 'critical'
+            : 'high'
+          : undefined,
+        evidence: vulnerable
+          ? `Unique ID ${uniqueId} found in response`
+          : undefined,
+      };
+    } catch (err) {
+      return {
+        payload,
+        vulnerable: false,
+        method: 'form_post',
+        field: fieldName,
+        error: this.extractErrorMessage(err),
+      };
+    }
+  }
+
+  private detectXSSInResponse(
+    responseData: string,
+    payload: string,
+    isStored: boolean = false,
+  ): boolean {
+    // 1. Check if payload exists in safe contexts
+    if (ScannerConfig.validation.excludeSafeContexts) {
+      const payloadIndex = responseData.indexOf(payload);
+      if (payloadIndex === -1 && !isStored) {
+        return false;
+      }
+
+      // Check if in safe context
+      for (const contextPattern of ScannerConfig.safeContextPatterns) {
+        const matches = Array.from(responseData.matchAll(contextPattern));
+        for (const match of matches) {
+          const matchIndex = match.index;
+          if (
+            matchIndex !== undefined &&
+            matchIndex <= payloadIndex &&
+            payloadIndex <= matchIndex + match[0].length
+          ) {
+            return false; // In safe context, not vulnerable
+          }
+        }
+      }
+    }
+
+    // 2. Check if properly encoded
+    if (ScannerConfig.xss.encodingCheck) {
+      const encodedPayload = this.htmlEncode(payload);
+      if (
+        responseData.includes(encodedPayload) &&
+        !responseData.includes(payload)
+      ) {
+        return false; // Properly encoded, safe
+      }
+    }
+
+    // 3. Direct payload match
+    if (responseData.includes(payload)) {
+      return true;
+    }
+
+    // 4. Check for dangerous patterns with context
+    const contextualPatterns = [
+      {
+        pattern: /<script[^>]*>.*?alert\s*\([^)]*\).*?<\/script>/i,
+        context: 'script',
+        requiresXSS: true,
+      },
+      {
+        pattern: /on\w+\s*=\s*["'].*?alert\s*\([^)]*\).*?["']/i,
+        context: 'event_handler',
+        requiresXSS: true,
+      },
+      {
+        pattern: /javascript:\s*alert\s*\(/i,
+        context: 'javascript_protocol',
+        requiresXSS: true,
+      },
+    ];
+
+    for (const { pattern, requiresXSS } of contextualPatterns) {
+      const match = responseData.match(pattern);
+      if (match) {
+        // Verify it's our injection
+        if (requiresXSS && !match[0].includes('XSS')) {
+          continue;
+        }
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  private htmlEncode(str: string): string {
+    return str
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#x27;')
+      .replace(/\//g, '&#x2F;');
+  }
+
+  private extractEvidence(responseData: string, payload: string): string {
+    const index = responseData.indexOf(payload);
+    if (index === -1)
+      return 'Payload not found directly but dangerous pattern detected';
+
+    const start = Math.max(0, index - 30);
+    const end = Math.min(responseData.length, index + payload.length + 30);
+    return `...${responseData.substring(start, end)}...`;
+  }
+
+  private deduplicateXSSResults(results: ScanXSSResult[]): ScanXSSResult[] {
+    const seen = new Map<string, ScanXSSResult>();
+
+    for (const result of results) {
+      // Create unique key for deduplication
+      const key = `${result.parameter || result.field}_${result.vulnerable}_${result.method}`;
+
+      if (!seen.has(key)) {
+        seen.set(key, result);
+      } else {
+        const existing = seen.get(key)!;
+        // Keep result with higher confidence
+        if ((result.confidence || 0) > (existing.confidence || 0)) {
+          seen.set(key, result);
+        }
+      }
+    }
+
+    return Array.from(seen.values());
   }
 
   private buildTestUrlWithParam(
@@ -349,7 +613,7 @@ export class ScanXSSService {
         'xss_scanner.py',
       );
 
-      // 传递参数信息给Python脚本
+      // Pass parameter information to Python script
       const args = [pythonScriptPath, url];
       if (pageInfo.urlParams.length > 0) {
         args.push('--params', pageInfo.urlParams.join(','));
@@ -390,26 +654,6 @@ export class ScanXSSService {
         resolve([]);
       });
     });
-  }
-
-  // ... 其他辅助方法保持不变 ...
-
-  private detectXSSInResponse(responseData: string, payload: string): boolean {
-    if (responseData.includes(payload)) {
-      return true;
-    }
-
-    const dangerousPatterns: RegExp[] = [
-      /<script[^>]*>/i,
-      /javascript:/i,
-      /on\w+\s*=/i,
-      /<svg[^>]*onload/i,
-      /<img[^>]*onerror/i,
-    ];
-
-    return dangerousPatterns.some((pattern: RegExp) =>
-      pattern.test(responseData),
-    );
   }
 
   private extractContext(responseData: string, payload: string): string {
@@ -498,7 +742,7 @@ export class ScanXSSService {
   }
 }
 
-// SQLi服务类似改进...
+// SQL Injection Service with improvements
 @Injectable()
 export class ScanSQLiService {
   private readonly logger = new Logger(ScanSQLiService.name);
@@ -507,20 +751,25 @@ export class ScanSQLiService {
     const results: ScanSQLInjectionResult[] = [];
 
     try {
-      // 1. 分析页面，获取实际的参数
+      // 1. Analyze page to get actual parameters
       const pageInfo = await this.analyzePage(url);
 
-      // 2. 基于时间的盲注检测
+      // 2. Time-based blind injection detection with baseline
       const timeBasedResults = await this.timeBasedSQLiCheck(url, pageInfo);
       results.push(...timeBasedResults);
 
-      // 3. 错误信息检测
+      // 3. Error-based detection with improved patterns
       const errorBasedResults = await this.errorBasedSQLiCheck(url, pageInfo);
       results.push(...errorBasedResults);
 
-      // 4. Python sqlmap 脚本
+      // 4. Python sqlmap script
       const pythonResults = await this.runPythonSQLScanner(url, pageInfo);
       results.push(...pythonResults);
+
+      // 5. Deduplicate results if enabled
+      if (ScannerConfig.validation.deduplicateResults) {
+        return this.deduplicateSQLResults(results);
+      }
     } catch (error) {
       this.logger.error('SQLi scan failed:', error);
     }
@@ -536,24 +785,24 @@ export class ScanSQLiService {
     const forms: PageForm[] = [];
 
     try {
-      // 从URL中提取参数
+      // Extract parameters from URL
       const urlObj = new URL(url);
       urlObj.searchParams.forEach((_, key) => {
         urlParams.push(key);
       });
 
-      // 获取页面内容
+      // Get page content
       const response = await axios.get(url, {
-        timeout: 10000,
+        timeout: ScannerConfig.network.timeout,
         headers: {
           'User-Agent': 'SecurityScanner/1.0',
         },
       });
 
-      // 使用 cheerio 解析HTML
+      // Parse HTML with cheerio
       const $ = cheerio.load(response.data as string);
 
-      // 查找所有表单
+      // Find all forms
       $('form').each((_, form) => {
         const $form = $(form);
         const formInfo: PageForm = {
@@ -562,7 +811,7 @@ export class ScanSQLiService {
           inputs: [],
         };
 
-        // 查找所有输入字段
+        // Find all input fields
         $form.find('input, textarea, select').each((_, input) => {
           const $input = $(input);
           const name = $input.attr('name');
@@ -585,14 +834,14 @@ export class ScanSQLiService {
       this.logger.warn('Page analysis failed:', error);
     }
 
-    // 如果没有找到参数，添加DVWA常用参数
+    // Add DVWA-specific parameters if none found
     if (urlParams.length === 0 && forms.length === 0) {
       if (url.includes('sqli')) {
         urlParams.push('id', 'Submit');
       } else if (url.includes('xss')) {
         urlParams.push('name', 'txtName');
       } else {
-        // SQL注入常用参数
+        // Common SQL injection parameters
         urlParams.push('id', 'user_id', 'product_id', 'page', 'category');
       }
     }
@@ -604,6 +853,34 @@ export class ScanSQLiService {
     url: string,
     pageInfo: { urlParams: string[]; forms: PageForm[] },
   ): Promise<ScanSQLInjectionResult[]> {
+    const results: ScanSQLInjectionResult[] = [];
+
+    // 1. Get baseline response times
+    const baselineTimes: number[] = [];
+    for (let i = 0; i < ScannerConfig.sql.baselineAttempts; i++) {
+      try {
+        const startTime = Date.now();
+        await axios.get(url, { timeout: ScannerConfig.network.timeout });
+        baselineTimes.push(Date.now() - startTime);
+        await new Promise((resolve) =>
+          setTimeout(resolve, ScannerConfig.sql.baselineDelay),
+        );
+      } catch (err) {
+        this.logger.warn('Baseline request failed:', err);
+      }
+    }
+
+    if (baselineTimes.length === 0) {
+      this.logger.warn(
+        'Could not establish baseline for time-based SQLi check',
+      );
+      return results;
+    }
+
+    const avgBaseline =
+      baselineTimes.reduce((a, b) => a + b) / baselineTimes.length;
+    const maxBaseline = Math.max(...baselineTimes);
+
     const timeBasedPayloads: string[] = [
       `1' AND SLEEP(5)--`,
       `1" AND SLEEP(5)--`,
@@ -611,45 +888,80 @@ export class ScanSQLiService {
       `1' AND pg_sleep(5)--`,
     ];
 
-    const results: ScanSQLInjectionResult[] = [];
-
-    // 测试每个参数
+    // Test each parameter
     for (const param of pageInfo.urlParams) {
       for (const payload of timeBasedPayloads) {
         const testUrl = this.buildTestUrlWithParam(url, param, payload);
 
-        try {
-          const startTime = Date.now();
-          await axios.get(testUrl, { timeout: 10000 });
-          const responseTime = Date.now() - startTime;
-          const vulnerable = responseTime > 4000;
+        // Test multiple times to reduce false positives
+        const testTimes: number[] = [];
+        let successCount = 0;
 
-          const result: ScanSQLInjectionResult = {
-            payload,
-            vulnerable,
-            method: 'time-based',
-            responseTime,
-            parameter: param,
-            url: testUrl,
-          };
+        for (let i = 0; i < ScannerConfig.sql.testAttempts; i++) {
+          try {
+            const startTime = Date.now();
+            await axios.get(testUrl, {
+              timeout: ScannerConfig.network.timeout,
+            });
+            const responseTime = Date.now() - startTime;
+            testTimes.push(responseTime);
 
-          if (vulnerable) {
-            result.evidence = `Response time: ${responseTime}ms`;
-            result.severity = 'high';
-            result.confidence = 85;
+            // Response time must be significantly greater than baseline
+            if (
+              responseTime >
+                avgBaseline + ScannerConfig.sql.timeBasedThreshold &&
+              responseTime > maxBaseline * 2
+            ) {
+              successCount++;
+            }
+          } catch (err: unknown) {
+            // Timeout also counts as potential vulnerability
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-call
+            if (axios.isAxiosError(err)) {
+              if (err.code === 'ECONNABORTED') {
+                successCount++;
+                testTimes.push(ScannerConfig.network.timeout);
+              } else {
+                this.logger.warn(
+                  'SQLi test request failed (axios):',
+                  err.message ?? String(err),
+                );
+              }
+            } else {
+              this.logger.warn(
+                'SQLi test request failed:',
+                this.extractErrorMessage(err),
+              );
+            }
           }
-
-          results.push(result);
-        } catch (err) {
-          const errorResult: ScanSQLInjectionResult = {
-            payload,
-            vulnerable: false,
-            method: 'time-based',
-            parameter: param,
-            error: this.extractErrorMessage(err),
-          };
-          results.push(errorResult);
         }
+
+        // Determine vulnerability based on success rate
+        const successRate = successCount / ScannerConfig.sql.testAttempts;
+        const vulnerable = successRate >= ScannerConfig.sql.minSuccessRate;
+        const avgTestTime =
+          testTimes.length > 0
+            ? testTimes.reduce((a, b) => a + b, 0) / testTimes.length
+            : 0;
+
+        const result: ScanSQLInjectionResult = {
+          payload,
+          vulnerable,
+          method: 'time-based',
+          responseTime: Math.round(avgTestTime),
+          parameter: param,
+          url: testUrl,
+        };
+
+        if (vulnerable) {
+          result.evidence = `Baseline: ${Math.round(avgBaseline)}ms, Test avg: ${Math.round(avgTestTime)}ms, Success rate: ${successCount}/${ScannerConfig.sql.testAttempts}`;
+          result.severity = 'high';
+          result.confidence = Math.min(95, Math.round(successRate * 100));
+          result.databaseType = this.inferDatabaseFromPayload(payload);
+          result.injectionType = 'time-blind';
+        }
+
+        results.push(result);
       }
     }
 
@@ -666,34 +978,26 @@ export class ScanSQLiService {
       `'; --`,
       `" OR 1=1--`,
       `' UNION SELECT NULL--`,
+      `1' AND '1'='2`,
+      `' OR '1'='1`,
     ];
 
     const results: ScanSQLInjectionResult[] = [];
-    const errorPatterns: RegExp[] = [
-      /mysql_fetch_array\(\)/i,
-      /you have an error in your sql syntax/i,
-      /mysql_num_rows\(\)/i,
-      /postgresql query failed/i,
-      /invalid input syntax/i,
-      /microsoft ole db provider for sql server/i,
-      /unclosed quotation mark after the character string/i,
-      /ora-\d{5}/i,
-      /sql syntax.*mysql/i,
-      /sql.*error/i,
-      /database error/i,
-    ];
 
-    // 测试每个参数
+    // Test each parameter
     for (const param of pageInfo.urlParams) {
       for (const payload of errorPayloads) {
         const testUrl = this.buildTestUrlWithParam(url, param, payload);
 
         try {
-          const response = await axios.get(testUrl, { timeout: 8000 });
+          const response = await axios.get(testUrl, {
+            timeout: ScannerConfig.network.timeout,
+          });
           const responseData = this.extractStringFromResponse(response);
-          const vulnerable = errorPatterns.some((pattern: RegExp) =>
-            pattern.test(responseData),
-          );
+
+          // Use improved SQL error detection
+          const errorDetection = this.detectSQLError(responseData);
+          const vulnerable = errorDetection.isError;
 
           const result: ScanSQLInjectionResult = {
             payload,
@@ -704,9 +1008,13 @@ export class ScanSQLiService {
           };
 
           if (vulnerable) {
-            result.evidence = this.extractSQLError(responseData, errorPatterns);
-            result.severity = 'critical';
-            result.confidence = 95;
+            result.evidence = errorDetection.evidence;
+            result.severity = this.calculateSeverityByPayload(payload);
+            result.confidence = errorDetection.confidence || 85;
+            result.databaseType = errorDetection.dbType;
+            result.injectionType = payload.includes("'") ? 'string' : 'numeric';
+            result.recommendation =
+              'Use parameterized queries or prepared statements';
           }
 
           results.push(result);
@@ -724,6 +1032,164 @@ export class ScanSQLiService {
     }
 
     return results;
+  }
+
+  private detectSQLError(responseData: string): SQLErrorDetection {
+    // Precise error patterns with confidence scores
+    const precisePatterns: Array<{
+      db: string;
+      pattern: RegExp;
+      weight: number;
+    }> = [
+      // MySQL errors
+      {
+        db: 'mysql',
+        pattern: /You have an error in your SQL syntax.*MySQL/i,
+        weight: 100,
+      },
+      {
+        db: 'mysql',
+        pattern: /Unknown column '[^']*' in 'where clause'/i,
+        weight: 95,
+      },
+      {
+        db: 'mysql',
+        pattern: /mysql_fetch_array\(\)/i,
+        weight: 90,
+      },
+      {
+        db: 'mysql',
+        pattern: /supplied argument is not a valid MySQL/i,
+        weight: 95,
+      },
+      // PostgreSQL errors
+      {
+        db: 'postgresql',
+        pattern: /ERROR:\s+syntax error at or near/i,
+        weight: 100,
+      },
+      {
+        db: 'postgresql',
+        pattern: /pg_query\(\).*failed/i,
+        weight: 95,
+      },
+      {
+        db: 'postgresql',
+        pattern: /unterminated quoted string/i,
+        weight: 90,
+      },
+      // MSSQL errors
+      {
+        db: 'mssql',
+        pattern: /Unclosed quotation mark after the character string/i,
+        weight: 100,
+      },
+      {
+        db: 'mssql',
+        pattern: /Microsoft OLE DB Provider for SQL Server/i,
+        weight: 95,
+      },
+      {
+        db: 'mssql',
+        pattern: /Incorrect syntax near/i,
+        weight: 85,
+      },
+      // Oracle errors
+      {
+        db: 'oracle',
+        pattern: /ORA-\d{5}:/i,
+        weight: 100,
+      },
+      {
+        db: 'oracle',
+        pattern: /Oracle.*Driver.*SQL/i,
+        weight: 95,
+      },
+      // SQLite errors
+      {
+        db: 'sqlite',
+        pattern: /sqlite_query\(\)/i,
+        weight: 95,
+      },
+      {
+        db: 'sqlite',
+        pattern: /no such table/i,
+        weight: 80,
+      },
+    ];
+
+    // Check for false positives first
+    if (ScannerConfig.validation.checkFalsePositives) {
+      for (const fp of ScannerConfig.falsePositivePatterns) {
+        if (fp.test(responseData)) {
+          return { isError: false };
+        }
+      }
+    }
+
+    // Check precise patterns
+    for (const { db, pattern, weight } of precisePatterns) {
+      const match = responseData.match(pattern);
+      if (match) {
+        const dbType = db as
+          | 'mysql'
+          | 'postgresql'
+          | 'mssql'
+          | 'oracle'
+          | 'sqlite'
+          | 'unknown';
+        return {
+          isError: true,
+          dbType: dbType,
+          evidence: match[0].substring(0, 200),
+          confidence: weight,
+        };
+      }
+    }
+
+    return { isError: false };
+  }
+
+  private inferDatabaseFromPayload(
+    payload: string,
+  ): 'mysql' | 'postgresql' | 'mssql' | 'oracle' | 'sqlite' | 'unknown' {
+    if (payload.includes('SLEEP')) return 'mysql';
+    if (payload.includes('pg_sleep')) return 'postgresql';
+    if (payload.includes('WAITFOR DELAY')) return 'mssql';
+    return 'unknown';
+  }
+
+  private calculateSeverityByPayload(
+    payload: string,
+  ): 'low' | 'medium' | 'high' | 'critical' {
+    if (payload.toUpperCase().includes('DROP TABLE')) return 'critical';
+    if (payload.toUpperCase().includes('UNION')) return 'high';
+    if (payload.includes('OR') && payload.includes('1=1')) return 'high';
+    if (payload === "'" || payload === '"') return 'medium';
+    return 'low';
+  }
+
+  private deduplicateSQLResults(
+    results: ScanSQLInjectionResult[],
+  ): ScanSQLInjectionResult[] {
+    const seen = new Map<string, ScanSQLInjectionResult>();
+
+    for (const result of results) {
+      // Create unique key for deduplication
+      const key = `${result.parameter}_${result.vulnerable}_${result.method}_${result.databaseType || 'unknown'}`;
+
+      if (!seen.has(key)) {
+        seen.set(key, result);
+      } else {
+        const existing = seen.get(key)!;
+        // Keep result with higher confidence
+        if ((result.confidence || 0) > (existing.confidence || 0)) {
+          seen.set(key, result);
+        }
+      }
+    }
+
+    return Array.from(seen.values());
   }
 
   private buildTestUrlWithParam(
@@ -747,7 +1213,7 @@ export class ScanSQLiService {
         'sql_scanner.py',
       );
 
-      // 传递参数信息给Python脚本
+      // Pass parameter information to Python script
       const args = [pythonScriptPath, url];
       if (pageInfo.urlParams.length > 0) {
         args.push('--params', pageInfo.urlParams.join(','));
@@ -789,8 +1255,6 @@ export class ScanSQLiService {
       });
     });
   }
-
-  // ... 其他辅助方法保持不变 ...
 
   private extractSQLError(responseData: string, patterns: RegExp[]): string {
     for (const pattern of patterns) {

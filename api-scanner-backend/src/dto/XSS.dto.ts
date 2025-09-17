@@ -8,7 +8,8 @@ export interface ScanXSSResult {
     | 'form_post'
     | 'form_get'
     | 'url_parameter'
-    | 'selenium_dynamic';
+    | 'selenium_dynamic'
+    | 'stored';
   severity?: 'low' | 'medium' | 'high' | 'critical';
   confidence?: number; // Confidence score (0-100)
   context?: string; // Vulnerability context

@@ -20,7 +20,7 @@ export interface ScanSQLInjectionResult {
     | 'oracle'
     | 'sqlite'
     | 'unknown';
-  injectionType?: 'numeric' | 'string' | 'blind' | 'time-blind';
+  injectionType?: 'numeric' | 'string' | 'blind' | 'time-blind' | 'union';
   error?: string;
   recommendation?: string;
 }
