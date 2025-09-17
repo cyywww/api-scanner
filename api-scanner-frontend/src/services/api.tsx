@@ -5,14 +5,24 @@ const BASE_URL = "http://localhost:3000"; // Address of the backend server
 
 // Scan XSS Vulnerabilities
 export const scanXSS = async (url: string): Promise<ScanResult[]> => {
-  const res = await axios.post<ScanResult[]>(`${BASE_URL}/scan/xss`, { url });
-  return res.data;
+  try {
+    const res = await axios.post<ScanResult[]>(`${BASE_URL}/scan/xss`, { url });
+    return res.data;
+  } catch (error) {
+    console.error('XSS scan failed:', error);
+    return [];
+  }
 };
 
 // Scan SQL Injection Vulnerabilities
 export const scanSQLInjection = async (url: string): Promise<ScanResult[]> => {
-  const res = await axios.post<ScanResult[]>(`${BASE_URL}/scan/sql`, { url });
-  return res.data;
+  try {
+    const res = await axios.post<ScanResult[]>(`${BASE_URL}/scan/sql`, { url });
+    return res.data;
+  } catch (error) {
+    console.error('SQL injection scan failed:', error);
+    return [];
+  }
 };
 
 // Scan All Vulnerabilities at once

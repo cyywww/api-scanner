@@ -1,7 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { spawn, ChildProcess } from 'child_process';
 import * as path from 'path';
-import axios from 'axios';
+import axios, { AxiosError } from 'axios';
 import * as cheerio from 'cheerio';
 import { ScanXSSResult } from '../dto/XSS.dto';
 import { ScanSQLInjectionResult } from '../dto/SQLInjection.dto';
@@ -916,8 +916,7 @@ export class ScanSQLiService {
             }
           } catch (err: unknown) {
             // Timeout also counts as potential vulnerability
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-call
-            if (axios.isAxiosError(err)) {
+            if (err instanceof AxiosError) {
               if (err.code === 'ECONNABORTED') {
                 successCount++;
                 testTimes.push(ScannerConfig.network.timeout);
