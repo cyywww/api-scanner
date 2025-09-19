@@ -1,7 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { spawn, ChildProcess } from 'child_process';
 import * as path from 'path';
-import axios, { AxiosError } from 'axios';
+import axios, { AxiosResponse } from 'axios';
 import * as cheerio from 'cheerio';
 import { ScanXSSResult } from '../dto/XSS.dto';
 import { ScanSQLInjectionResult } from '../dto/SQLInjection.dto';
@@ -15,15 +15,7 @@ type ScanMethod =
   | 'form_get'
   | 'url_parameter'
   | 'selenium_dynamic'
-  | 'stored'; // Added for stored XSS detection
-
-interface AxiosRequestConfig {
-  timeout: number;
-  maxRedirects?: number;
-  headers?: Record<string, string>;
-  maxContentLength?: number;
-  maxBodyLength?: number;
-}
+  | 'stored';
 
 interface ProcessData {
   output: string;
@@ -44,14 +36,11 @@ interface PageForm {
     name: string;
     type: string;
     value?: string;
+    required?: boolean;
+    pattern?: string;
+    placeholder?: string;
+    maxlength?: number;
   }>;
-}
-
-interface SQLErrorDetection {
-  isError: boolean;
-  dbType?: 'mysql' | 'postgresql' | 'mssql' | 'oracle' | 'sqlite' | 'unknown';
-  evidence?: string;
-  confidence?: number;
 }
 
 @Injectable()
@@ -240,18 +229,17 @@ export class ScanXSSService {
     parameter: string,
     method: string,
   ): Promise<ScanXSSResult> {
-    const config: AxiosRequestConfig = {
-      timeout: ScannerConfig.network.timeout,
-      maxRedirects: 5,
-      headers: {
-        'User-Agent': 'SecurityScanner/1.0',
-      },
-      maxContentLength: ScannerConfig.network.maxContentLength,
-      maxBodyLength: ScannerConfig.network.maxContentLength,
-    };
-
     try {
-      const response = await axios.get(testUrl, config);
+      const response = await axios.get(testUrl, {
+        timeout: ScannerConfig.network.timeout,
+        maxRedirects: 5,
+        headers: {
+          'User-Agent': 'SecurityScanner/1.0',
+        },
+        maxContentLength: ScannerConfig.network.maxContentLength,
+        maxBodyLength: ScannerConfig.network.maxContentLength,
+      });
+
       const responseData = this.extractStringFromResponse(response);
       const vulnerable = this.detectXSSInResponse(responseData, payload, false);
 
@@ -301,18 +289,22 @@ export class ScanXSSService {
         }
       });
 
-      const config: AxiosRequestConfig = {
-        timeout: ScannerConfig.network.timeout,
-        headers: {
-          'User-Agent': 'SecurityScanner/1.0',
-        },
-      };
-
-      let response;
+      let response: AxiosResponse<any>;
       if (form.method === 'POST') {
-        response = await axios.post(formUrl, formData, config);
+        response = await axios.post(formUrl, formData, {
+          timeout: ScannerConfig.network.timeout,
+          headers: {
+            'User-Agent': 'SecurityScanner/1.0',
+          },
+        });
       } else {
-        response = await axios.get(formUrl, { ...config, params: formData });
+        response = await axios.get(formUrl, {
+          timeout: ScannerConfig.network.timeout,
+          headers: {
+            'User-Agent': 'SecurityScanner/1.0',
+          },
+          params: formData,
+        });
       }
 
       const responseData = this.extractStringFromResponse(response);
@@ -366,19 +358,20 @@ export class ScanXSSService {
       });
 
       // 1. Submit payload
-      const config: AxiosRequestConfig = {
-        timeout: ScannerConfig.network.timeout,
-        headers: {
-          'User-Agent': 'SecurityScanner/1.0',
-        },
-      };
-
-      let submitResponse;
+      let submitResponse: AxiosResponse<any>;
       if (form.method === 'POST') {
-        submitResponse = await axios.post(formUrl, formData, config);
+        submitResponse = await axios.post(formUrl, formData, {
+          timeout: ScannerConfig.network.timeout,
+          headers: {
+            'User-Agent': 'SecurityScanner/1.0',
+          },
+        });
       } else {
         submitResponse = await axios.get(formUrl, {
-          ...config,
+          timeout: ScannerConfig.network.timeout,
+          headers: {
+            'User-Agent': 'SecurityScanner/1.0',
+          },
           params: formData,
         });
       }
@@ -400,7 +393,12 @@ export class ScanXSSService {
         );
 
         // Re-visit the page
-        const viewResponse = await axios.get(baseUrl, config);
+        const viewResponse = await axios.get(baseUrl, {
+          timeout: ScannerConfig.network.timeout,
+          headers: {
+            'User-Agent': 'SecurityScanner/1.0',
+          },
+        });
         const viewResponseData = this.extractStringFromResponse(viewResponse);
         vulnerable = this.detectXSSInResponse(
           viewResponseData,
@@ -417,7 +415,12 @@ export class ScanXSSService {
           for (const page of ScannerConfig.xss.storedXSSPages) {
             try {
               const pageUrl = new URL(page, baseUrl).toString();
-              const pageResponse = await axios.get(pageUrl, config);
+              const pageResponse = await axios.get(pageUrl, {
+                timeout: ScannerConfig.network.timeout,
+                headers: {
+                  'User-Agent': 'SecurityScanner/1.0',
+                },
+              });
               const pageData = this.extractStringFromResponse(pageResponse);
               if (pageData.includes(uniqueId)) {
                 vulnerable = true;
@@ -565,7 +568,8 @@ export class ScanXSSService {
       if (!seen.has(key)) {
         seen.set(key, result);
       } else {
-        const existing = seen.get(key)!;
+        const existing = seen.get(key);
+        if (!existing) continue;
         // Keep result with higher confidence
         if ((result.confidence || 0) > (existing.confidence || 0)) {
           seen.set(key, result);
@@ -665,8 +669,8 @@ export class ScanXSSService {
     return responseData.substring(start, end);
   }
 
-  private extractStringFromResponse(response: { data: unknown }): string {
-    const responseData = response.data;
+  private extractStringFromResponse(response: AxiosResponse<any>): string {
+    const responseData: unknown = response.data;
 
     if (typeof responseData === 'string') {
       return responseData;
@@ -914,23 +918,14 @@ export class ScanSQLiService {
             ) {
               successCount++;
             }
-          } catch (err: unknown) {
+          } catch (err) {
             // Timeout also counts as potential vulnerability
-            if (err instanceof AxiosError) {
-              if (err.code === 'ECONNABORTED') {
+            if (err && typeof err === 'object' && 'code' in err) {
+              const errorCode = (err as { code?: string }).code;
+              if (errorCode === 'ECONNABORTED') {
                 successCount++;
                 testTimes.push(ScannerConfig.network.timeout);
-              } else {
-                this.logger.warn(
-                  'SQLi test request failed (axios):',
-                  err.message || 'Unknown axios error',
-                );
               }
-            } else {
-              this.logger.warn(
-                'SQLi test request failed:',
-                this.extractErrorMessage(err),
-              );
             }
           }
         }
@@ -1033,7 +1028,12 @@ export class ScanSQLiService {
     return results;
   }
 
-  private detectSQLError(responseData: string): SQLErrorDetection {
+  private detectSQLError(responseData: string): {
+    isError: boolean;
+    dbType?: 'mysql' | 'postgresql' | 'mssql' | 'oracle' | 'sqlite' | 'unknown';
+    evidence?: string;
+    confidence?: number;
+  } {
     // Precise error patterns with confidence scores
     const precisePatterns: Array<{
       db: string;
@@ -1135,8 +1135,7 @@ export class ScanSQLiService {
           | 'postgresql'
           | 'mssql'
           | 'oracle'
-          | 'sqlite'
-          | 'unknown';
+          | 'sqlite';
         return {
           isError: true,
           dbType: dbType,
@@ -1180,7 +1179,8 @@ export class ScanSQLiService {
       if (!seen.has(key)) {
         seen.set(key, result);
       } else {
-        const existing = seen.get(key)!;
+        const existing = seen.get(key);
+        if (!existing) continue;
         // Keep result with higher confidence
         if ((result.confidence || 0) > (existing.confidence || 0)) {
           seen.set(key, result);
@@ -1255,8 +1255,8 @@ export class ScanSQLiService {
     });
   }
 
-  private extractStringFromResponse(response: { data: unknown }): string {
-    const responseData = response.data;
+  private extractStringFromResponse(response: AxiosResponse<any>): string {
+    const responseData: unknown = response.data;
 
     if (typeof responseData === 'string') {
       return responseData;
