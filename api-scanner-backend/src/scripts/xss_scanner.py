@@ -1,89 +1,67 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-# xss_scanner.py - XSS vulnerability scanner
-
 import sys
 import json
 import requests
 import re
 import argparse
+import time
 from urllib.parse import urljoin, urlparse, parse_qs
 from bs4 import BeautifulSoup
 
-try:
-    from selenium import webdriver
-    from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    SELENIUM_AVAILABLE = True
-except ImportError:
-    SELENIUM_AVAILABLE = False
-
 class AdvancedXSSScanner:
-    def __init__(self, target_url, custom_params=None):
+    def __init__(self, target_url, custom_params=None, cookies=None):
         self.target_url = target_url
         self.custom_params = custom_params or []
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         })
         
-        # Advanced XSS payloads
+        # Handle cookies for authentication
+        if cookies:
+            for cookie in cookies.split(';'):
+                if '=' in cookie:
+                    name, value = cookie.strip().split('=', 1)
+                    self.session.cookies.set(name, value)
+        
+        # Basic XSS payloads
         self.advanced_payloads = [
-            # WAF bypass
-            '<ScRiPt>alert("XSS")</ScRiPt>',
-            '<script>alert(String.fromCharCode(88,83,83))</script>',
+            '<script>alert("XSS")</script>',
             '<img src=x onerror=alert("XSS")>',
-            '"><svg onload=alert("XSS")>',
-            
-            # Context breaking
-            '";alert("XSS");"',
+            '"><script>alert("XSS")</script>',
             "';alert('XSS');//",
-            '</textarea><script>alert("XSS")</script>',
-            '</title><script>alert("XSS")</script>',
-            
-            # Encoding bypass
-            '<img src=x onerror="&#97;&#108;&#101;&#114;&#116;&#40;&#34;&#88;&#83;&#83;&#34;&#41;">',
-            '<script>eval("\\x61\\x6c\\x65\\x72\\x74\\x28\\x27\\x58\\x53\\x83\\x27\\x29")</script>',
-            
-            # URL encoding
-            '%3Cscript%3Ealert(%22XSS%22)%3C/script%3E',
-            '&#60;script&#62;alert(&#34;XSS&#34;)&#60;/script&#62;',
         ]
         
         self.results = []
 
     def scan_url_parameters(self):
-        """Scan URL parameters - prioritize custom params if provided"""
+        """Scan URL parameters - only if they exist"""
         parsed_url = urlparse(self.target_url)
         params = parse_qs(parsed_url.query)
         
         if self.custom_params:
-            # Use provided parameters
-            print(f"[INFO] Testing custom parameters: {self.custom_params}", file=sys.stderr)
+            print(f"[INFO] Testing custom URL parameters: {self.custom_params}", file=sys.stderr)
             for param in self.custom_params:
                 self.test_parameter(param, 'test_value')
         elif params:
-            # Use existing URL parameters
-            print(f"[INFO] Testing URL parameters: {list(params.keys())}", file=sys.stderr)
+            print(f"[INFO] Testing existing URL parameters: {list(params.keys())}", file=sys.stderr)
             for param_name, param_values in params.items():
                 self.test_parameter(param_name, param_values[0] if param_values else 'test')
         else:
-            # Use common parameters
-            print("[INFO] No parameters found, testing common ones", file=sys.stderr)
-            common_params = ['q', 'search', 'query', 'id', 'page', 'category']
-            for param in common_params:
-                self.test_parameter(param, 'test_value')
+            print("[INFO] No URL parameters found, skipping URL parameter tests", file=sys.stderr)
 
     def test_parameter(self, param_name, original_value):
-        """Test a single parameter for XSS vulnerabilities"""
+        """Test a single URL parameter for XSS vulnerabilities"""
         base_url = self.target_url.split('?')[0]
         
         for payload in self.advanced_payloads:
             try:
                 test_url = f"{base_url}?{param_name}={payload}"
-                response = self.session.get(test_url, timeout=10)
+                response = self.session.get(test_url, timeout=10, allow_redirects=False)
+                
+                # Check if we got redirected to login
+                if response.status_code == 302 and 'login' in response.headers.get('Location', '').lower():
+                    print(f"[WARNING] Redirected to login page. Session may have expired.", file=sys.stderr)
+                    continue
                 
                 vulnerable = self.detect_xss_in_response(response.text, payload)
                 
@@ -93,7 +71,8 @@ class AdvancedXSSScanner:
                     'method': 'url_parameter',
                     'parameter': param_name,
                     'url': test_url,
-                    'context': self.extract_context(response.text, payload) if vulnerable else None
+                    'confidence': 85 if vulnerable else 0,
+                    'severity': 'high' if vulnerable else None
                 })
                 
             except Exception as e:
@@ -108,77 +87,118 @@ class AdvancedXSSScanner:
     def scan_forms(self):
         """Scan forms in the page"""
         try:
-            response = self.session.get(self.target_url, timeout=10)
+            response = self.session.get(self.target_url, timeout=10, allow_redirects=True)
+            
+            # Check if we're on a login page
+            if 'login' in response.url.lower() and 'login' not in self.target_url.lower():
+                print(f"[ERROR] Redirected to login page. Please ensure you're logged in.", file=sys.stderr)
+                return
+            
             soup = BeautifulSoup(response.content, 'html.parser')
             forms = soup.find_all('form')
             
-            print(f"[INFO] Found {len(forms)} forms", file=sys.stderr)
+            print(f"[INFO] Found {len(forms)} forms on the page", file=sys.stderr)
             
-            for form in forms:
+            for idx, form in enumerate(forms):
                 action = form.get('action', '')
                 method = form.get('method', 'get').lower()
                 
-                form_url = urljoin(self.target_url, action)
+                # Handle form action
+                if not action or action == '' or action == '#':
+                    # Submit to same page
+                    form_url = self.target_url.split('?')[0]
+                else:
+                    # Resolve relative URLs
+                    form_url = urljoin(self.target_url, action)
                 
+                print(f"[INFO] Form {idx+1}: method={method}, action='{action}' => '{form_url}'", file=sys.stderr)
+                
+                # Get form fields
                 inputs = form.find_all(['input', 'textarea', 'select'])
                 form_data = {}
+                testable_fields = []
                 
                 for input_field in inputs:
                     name = input_field.get('name')
-                    if name:
-                        input_type = input_field.get('type', 'text')
-                        if input_type not in ['submit', 'reset', 'button']:
-                            # Only test if no custom params or field is in custom params
-                            if not self.custom_params or name in self.custom_params:
-                                form_data[name] = 'test_value'
+                    if not name:
+                        continue
+                    
+                    input_type = input_field.get('type', 'text')
+                    
+                    if input_type == 'submit':
+                        form_data[name] = input_field.get('value', 'Submit')
+                    elif input_type == 'hidden':
+                        form_data[name] = input_field.get('value', '')
+                    elif input_type not in ['button', 'reset']:
+                        form_data[name] = 'test'
+                        testable_fields.append(name)
                 
-                if form_data:
-                    self.test_form(form_url, method, form_data)
+                if testable_fields:
+                    print(f"[INFO] Form has testable fields: {testable_fields}", file=sys.stderr)
+                    self.test_form(form_url, method, form_data, testable_fields)
                     
         except Exception as e:
-            self.results.append({
-                'payload': 'form_scan',
-                'vulnerable': False,
-                'error': str(e),
-                'method': 'form_analysis'
-            })
+            print(f"[ERROR] Form scan failed: {str(e)}", file=sys.stderr)
 
-    def test_form(self, form_url, method, form_data):
-        """Test a single form for XSS vulnerabilities"""
-        for payload in self.advanced_payloads[:5]:  # Limit to 5 payloads for forms
-            test_data = form_data.copy()
-            
-            for field_name in test_data:
-                test_data[field_name] = payload
+    def test_form(self, form_url, method, form_data, testable_fields):
+        """Test form fields for XSS vulnerabilities"""
+        is_stored_xss = 'xss_s' in self.target_url or 'stored' in self.target_url
+        
+        for field_name in testable_fields:
+            for payload in self.advanced_payloads:
+                test_data = form_data.copy()
+                
+                # Create unique payload for tracking
+                unique_id = f"XSS_{int(time.time())}_{hash(payload) % 10000}"
+                tagged_payload = payload.replace('XSS', unique_id)
+                test_data[field_name] = tagged_payload
+                
+                # Fill other fields with safe values
+                for other_field in testable_fields:
+                    if other_field != field_name:
+                        test_data[other_field] = f"Test_{other_field}"
                 
                 try:
-                    if method == 'post':
-                        response = self.session.post(form_url, data=test_data, timeout=10)
-                    else:
-                        response = self.session.get(form_url, params=test_data, timeout=10)
+                    print(f"[DEBUG] Testing field '{field_name}' with {method.upper()} to {form_url}", file=sys.stderr)
                     
-                    vulnerable = self.detect_xss_in_response(response.text, payload)
+                    # Submit form
+                    if method == 'post':
+                        response = self.session.post(form_url, data=test_data, timeout=10, allow_redirects=True)
+                    else:
+                        response = self.session.get(form_url, params=test_data, timeout=10, allow_redirects=True)
+                    
+                    # Check immediate response
+                    vulnerable = self.detect_xss_in_response(response.text, tagged_payload)
+                    detected_method = f'form_{method}'
+                    
+                    # Check for stored XSS
+                    if not vulnerable and is_stored_xss:
+                        time.sleep(1)
+                        check_response = self.session.get(self.target_url, timeout=10)
+                        if self.detect_xss_in_response(check_response.text, tagged_payload):
+                            vulnerable = True
+                            detected_method = 'stored'
+                            print(f"[FOUND] Stored XSS vulnerability in field '{field_name}'!", file=sys.stderr)
                     
                     self.results.append({
-                        'payload': payload,
+                        'payload': tagged_payload,
                         'vulnerable': vulnerable,
-                        'method': f'form_{method}',
+                        'method': detected_method,
                         'field': field_name,
-                        'url': form_url,
-                        'context': self.extract_context(response.text, payload) if vulnerable else None
+                        'url': self.target_url if detected_method == 'stored' else form_url,
+                        'confidence': 95 if detected_method == 'stored' else 90 if vulnerable else 0,
+                        'severity': 'critical' if detected_method == 'stored' else 'high' if vulnerable else None
                     })
                     
                 except Exception as e:
+                    print(f"[ERROR] Failed testing field '{field_name}': {str(e)}", file=sys.stderr)
                     self.results.append({
-                        'payload': payload,
+                        'payload': tagged_payload,
                         'vulnerable': False,
-                        'error': str(e),
                         'method': f'form_{method}',
-                        'field': field_name
+                        'field': field_name,
+                        'error': str(e)
                     })
-                
-                # Reset the field value
-                test_data[field_name] = form_data[field_name]
 
     def detect_xss_in_response(self, response_text, payload):
         """Check if XSS payload is reflected in response"""
@@ -186,94 +206,30 @@ class AdvancedXSSScanner:
         if payload in response_text:
             return True
         
-        # Check dangerous patterns
-        dangerous_patterns = [
-            r'<script[^>]*>.*?</script>',
-            r'javascript:',
-            r'on\w+\s*=',
-            r'<svg[^>]*onload',
-            r'<img[^>]*onerror'
-        ]
+        # Check for unique IDs (stored XSS)
+        if 'XSS_' in payload:
+            match = re.search(r'XSS_\d+_\d+', payload)
+            if match and match.group() in response_text:
+                return True
         
-        for pattern in dangerous_patterns:
-            if re.search(pattern, response_text, re.IGNORECASE):
+        # Check for script execution patterns
+        if 'alert' in payload and 'alert' in response_text:
+            if re.search(r'<script[^>]*>.*?alert.*?</script>', response_text, re.IGNORECASE | re.DOTALL):
                 return True
         
         return False
-
-    def extract_context(self, response_text, payload):
-        """Extract context around payload in response"""
-        try:
-            index = response_text.find(payload)
-            if index != -1:
-                start = max(0, index - 100)
-                end = min(len(response_text), index + len(payload) + 100)
-                return response_text[start:end].strip()
-        except:
-            pass
-        return None
-
-    def dynamic_scan_with_selenium(self):
-        """Dynamic scanning using Selenium (if available)"""
-        if not SELENIUM_AVAILABLE:
-            print("[WARNING] Selenium not installed, skipping dynamic scan", file=sys.stderr)
-            return
-            
-        chrome_options = Options()
-        chrome_options.add_argument('--headless')
-        chrome_options.add_argument('--no-sandbox')
-        chrome_options.add_argument('--disable-dev-shm-usage')
-        chrome_options.add_argument('--disable-gpu')
-        
-        try:
-            driver = webdriver.Chrome(options=chrome_options)
-            
-            test_payloads = [
-                '<script>document.title="XSS_DETECTED"</script>',
-                '<img src=x onerror="document.title=\'IMG_XSS_DETECTED\'">',
-            ]
-            
-            for payload in test_payloads:
-                try:
-                    test_url = f"{self.target_url}{'&' if '?' in self.target_url else '?'}test={payload}"
-                    driver.get(test_url)
-                    
-                    WebDriverWait(driver, 5).until(
-                        lambda d: d.execute_script("return document.readyState") == "complete"
-                    )
-                    
-                    title = driver.title
-                    vulnerable = 'XSS_DETECTED' in title or 'IMG_XSS_DETECTED' in title
-                    
-                    self.results.append({
-                        'payload': payload,
-                        'vulnerable': vulnerable,
-                        'method': 'selenium_dynamic',
-                        'evidence': f'Title changed to: {title}' if vulnerable else None
-                    })
-                    
-                except Exception as e:
-                    self.results.append({
-                        'payload': payload,
-                        'vulnerable': False,
-                        'error': str(e),
-                        'method': 'selenium_dynamic'
-                    })
-            
-            driver.quit()
-            
-        except Exception as e:
-            self.results.append({
-                'payload': 'selenium_scan',
-                'vulnerable': False,
-                'error': f'Selenium setup failed: {str(e)}',
-                'method': 'selenium_dynamic'
-            })
 
     def run_scan(self):
         """Run complete XSS scan"""
         try:
             print(f"[INFO] Starting XSS scan for: {self.target_url}", file=sys.stderr)
+            
+            # Check if we can access the target
+            test_response = self.session.get(self.target_url, timeout=10, allow_redirects=True)
+            if 'login' in test_response.url.lower() and 'login' not in self.target_url.lower():
+                print(f"[ERROR] Target URL redirects to login. Please provide valid session cookies.", file=sys.stderr)
+                print(f"[ERROR] Use: --cookies 'PHPSESSID=your_session_id; security=low'", file=sys.stderr)
+                return []
             
             # 1. URL parameter scan
             self.scan_url_parameters()
@@ -281,43 +237,28 @@ class AdvancedXSSScanner:
             # 2. Form scan
             self.scan_forms()
             
-            # 3. Dynamic scan (if Selenium available)
-            if SELENIUM_AVAILABLE:
-                self.dynamic_scan_with_selenium()
-            
             print(f"[INFO] Scan completed. Total tests: {len(self.results)}", file=sys.stderr)
             
         except Exception as e:
-            self.results.append({
-                'payload': 'general_scan',
-                'vulnerable': False,
-                'error': f'General scan error: {str(e)}',
-                'method': 'error'
-            })
+            print(f"[ERROR] Scan failed: {str(e)}", file=sys.stderr)
         
         return self.results
 
 def main():
-    # Parse command line arguments
     parser = argparse.ArgumentParser(description='Advanced XSS Scanner')
     parser.add_argument('url', help='Target URL to scan')
-    parser.add_argument('--params', 
-                       help='Comma-separated list of parameters to test',
-                       default='')
+    parser.add_argument('--params', help='Comma-separated list of parameters', default='')
+    parser.add_argument('--cookies', help='Cookies for authentication (e.g., "PHPSESSID=abc123; security=low")', default='')
     
     args = parser.parse_args()
     
-    # Process parameters
     custom_params = []
     if args.params:
         custom_params = [p.strip() for p in args.params.split(',') if p.strip()]
-        print(f"[DEBUG] Received params from TypeScript: {custom_params}", file=sys.stderr)
     
-    # Create scanner and run
-    scanner = AdvancedXSSScanner(args.url, custom_params)
+    scanner = AdvancedXSSScanner(args.url, custom_params, args.cookies)
     results = scanner.run_scan()
     
-    # Output JSON results
     print(json.dumps(results, indent=2))
 
 if __name__ == "__main__":

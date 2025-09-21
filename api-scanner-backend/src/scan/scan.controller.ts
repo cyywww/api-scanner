@@ -3,6 +3,17 @@ import { ScanXSSService, ScanSQLiService } from './scan.service';
 import { ScanXSSResult } from '../dto/XSS.dto';
 import { ScanSQLInjectionResult } from '../dto/SQLInjection.dto';
 
+interface AuthConfig {
+  type: 'none' | 'cookie' | 'header';
+  cookies?: Record<string, string>;
+  headers?: Record<string, string>;
+}
+
+interface ScanRequest {
+  url: string;
+  authConfig?: AuthConfig;
+}
+
 @Controller('scan')
 export class ScanController {
   constructor(
@@ -11,7 +22,9 @@ export class ScanController {
   ) {}
 
   @Post('xss')
-  async scanXSS(@Body('url') url: string): Promise<ScanXSSResult[]> {
+  async scanXSS(@Body() body: ScanRequest): Promise<ScanXSSResult[]> {
+    const { url, authConfig } = body;
+
     if (!url || typeof url !== 'string') {
       throw new BadRequestException('URL is required');
     }
@@ -22,11 +35,13 @@ export class ScanController {
       throw new BadRequestException('Invalid URL format');
     }
 
-    return this.scanService.scanForXSS(url);
+    return this.scanService.scanForXSS(url, authConfig);
   }
 
   @Post('sql')
-  async scanSQLi(@Body('url') url: string): Promise<ScanSQLInjectionResult[]> {
+  async scanSQLi(@Body() body: ScanRequest): Promise<ScanSQLInjectionResult[]> {
+    const { url, authConfig } = body;
+
     if (!url || typeof url !== 'string') {
       throw new BadRequestException('URL is required');
     }
@@ -37,6 +52,6 @@ export class ScanController {
       throw new BadRequestException('Invalid URL format');
     }
 
-    return this.sqliService.scanForSQLi(url);
+    return this.sqliService.scanForSQLi(url, authConfig);
   }
 }

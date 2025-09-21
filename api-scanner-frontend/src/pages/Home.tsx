@@ -1,8 +1,37 @@
-
 import { useState } from 'react';
 import { scanXSS, scanSQLInjection } from '../services/api';
 import { ResultTable } from '../components/ResultTable';
 import type { ScanResult } from '../types/scan.types';
+
+interface AuthConfig {
+  type: 'none' | 'cookie' | 'header';
+  cookies?: Record<string, string>;
+  headers?: Record<string, string>;
+}
+
+const PLATFORM_PRESETS = {
+  none: {
+    name: 'Authentication Not Required',
+    type: 'none' as const,
+    config: { type: 'none' as const }
+  },
+  dvwa: {
+    name: 'DVWA',
+    type: 'cookie' as const,
+    config: {
+      type: 'cookie' as const,
+      cookies: {
+        'PHPSESSID': '',
+        'security': 'low'
+      }
+    }
+  },
+  custom: {
+    name: 'Customize',
+    type: 'custom' as const,
+    config: { type: 'none' as const }
+  }
+};
 
 export default function Home() {
   const [url, setUrl] = useState('');
@@ -11,16 +40,58 @@ export default function Home() {
   const [xssLoading, setXssLoading] = useState(false);
   const [sqlLoading, setSqlLoading] = useState(false);
   const [activeTab, setActiveTab] = useState('summary');
+  
+  const [selectedPlatform, setSelectedPlatform] = useState('none');
+  const [showAuthModal, setShowAuthModal] = useState(false);
+  const [sessionId, setSessionId] = useState('');
+  const [customAuthType, setCustomAuthType] = useState<'cookie' | 'header'>('cookie');
+  const [customAuthData, setCustomAuthData] = useState('');
+
+  const buildAuthConfig = (): AuthConfig | undefined => {
+    if (selectedPlatform === 'none') {
+      return undefined;
+    }
+    
+    if (selectedPlatform === 'dvwa' && sessionId) {
+      return {
+        type: 'cookie',
+        cookies: {
+          'PHPSESSID': sessionId,
+          'security': 'low'
+        }
+      };
+    }
+    
+    if (selectedPlatform === 'custom' && customAuthData) {
+      try {
+        if (customAuthType === 'cookie') {
+          const cookies: Record<string, string> = {};
+          customAuthData.split(';').forEach(cookie => {
+            const [key, value] = cookie.trim().split('=');
+            if (key && value) cookies[key] = value;
+          });
+          return { type: 'cookie', cookies };
+        } else {
+          const headers = JSON.parse(customAuthData);
+          return { type: 'header', headers };
+        }
+      } catch {
+        console.error('Invalid auth data format');
+      }
+    }
+    
+    return undefined;
+  };
 
   const handleXSSScan = async () => {
     setXssLoading(true);
-    // Clear all results.
     setXssResults([]);
     setSqlResults([]);
     try {
-      const data = await scanXSS(url);
+      const authConfig = buildAuthConfig();
+      const data = await scanXSS(url, authConfig);
       setXssResults(data);
-      setActiveTab('xss');  // Switch to the XSS tab directly.
+      setActiveTab('xss');
     } catch (err) {
       console.error(err);
     } finally {
@@ -30,13 +101,13 @@ export default function Home() {
 
   const handleSQLScan = async () => {
     setSqlLoading(true);
-    // Clear all results.
     setSqlResults([]);
     setXssResults([]);
     try {
-      const data = await scanSQLInjection(url);
+      const authConfig = buildAuthConfig();
+      const data = await scanSQLInjection(url, authConfig);
       setSqlResults(data);
-      setActiveTab('sql');  // Switch to the SQL tab directly.
+      setActiveTab('sql');
     } catch (err) {
       console.error(err);
     } finally {
@@ -46,18 +117,16 @@ export default function Home() {
 
   const handleScanAll = async () => {
     setActiveTab('summary');
-    // Set loading state.
     setXssLoading(true);
     setSqlLoading(true);
-    // Clear all results.
     setXssResults([]);
     setSqlResults([]);
     
     try {
-      // Execute two scans in parallel.
+      const authConfig = buildAuthConfig();
       const [xssData, sqlData] = await Promise.all([
-        scanXSS(url),
-        scanSQLInjection(url)
+        scanXSS(url, authConfig),
+        scanSQLInjection(url, authConfig)
       ]);
       
       setXssResults(xssData);
@@ -93,20 +162,136 @@ export default function Home() {
 
         {/* URL Input Card */}
         <div className="bg-white rounded-2xl shadow-xl p-8 mb-8">
-          <label className="block text-sm font-medium text-gray-700 mb-3">Target URL</label>
-          <div className="relative">
-            <input
-              type="text"
-              placeholder="http://localhost/vulnerabilities/xss_r/?name=test"
-              value={url}
-              onChange={(e) => setUrl(e.target.value)}
-              className="w-full px-6 py-4 pr-12 text-lg border-2 border-gray-200 rounded-xl focus:border-blue-500 focus:ring-4 focus:ring-blue-100 focus:outline-none transition-all"
-            />
-            <svg className="absolute right-4 top-1/2 -translate-y-1/2 w-6 h-6 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9" />
-            </svg>
+          <div className="mb-6">
+            <label className="block text-sm font-medium text-gray-700 mb-3">Target URL</label>
+            <div className="relative">
+              <input
+                type="text"
+                placeholder="http://localhost/vulnerabilities/xss_r/?name=test"
+                value={url}
+                onChange={(e) => setUrl(e.target.value)}
+                className="w-full px-6 py-4 pr-12 text-lg border-2 border-gray-200 rounded-xl focus:border-blue-500 focus:ring-4 focus:ring-blue-100 focus:outline-none transition-all"
+              />
+              <svg className="absolute right-4 top-1/2 -translate-y-1/2 w-6 h-6 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9" />
+              </svg>
+            </div>
+          </div>
+
+          {/* Authentication Configuration */}
+          <div className="border-t pt-6">
+            <div className="flex items-center justify-between mb-4">
+              <label className="block text-sm font-medium text-gray-700">Authentication Configuration</label>
+              <button
+                onClick={() => setShowAuthModal(true)}
+                className="text-sm text-blue-600 hover:text-blue-800"
+              >
+                Configure Authentication
+              </button>
+            </div>
+            
+            <div className="grid grid-cols-3 gap-4">
+              {Object.entries(PLATFORM_PRESETS).map(([key, preset]) => (
+                <button
+                  key={key}
+                  onClick={() => {
+                    setSelectedPlatform(key);
+                    if (key === 'dvwa' || key === 'custom') {
+                      setShowAuthModal(true);
+                    }
+                  }}
+                  className={`py-3 px-4 rounded-lg font-medium transition-all ${
+                    selectedPlatform === key
+                      ? 'bg-blue-500 text-white'
+                      : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                  }`}
+                >
+                  {preset.name}
+                  {key === 'dvwa' && sessionId && (
+                    <span className="block text-xs mt-1">已配置</span>
+                  )}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
+
+        {/* Authentication Configuration Modal */}
+        {showAuthModal && (
+          <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+            <div className="bg-white rounded-xl p-6 w-full max-w-md">
+              <h3 className="text-lg font-semibold mb-4">
+                {selectedPlatform === 'dvwa' ? 'DVWA Authentication Configuration' : 'Customize Authentication Configuration'}
+              </h3>
+              
+              {selectedPlatform === 'dvwa' ? (
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    PHPSESSID
+                  </label>
+                  <input
+                    type="text"
+                    value={sessionId}
+                    onChange={(e) => setSessionId(e.target.value)}
+                    placeholder="输入您的session ID"
+                    className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                  <p className="text-xs text-gray-500 mt-2">
+                    Copy the value of PHPSESSID using browser's developer tools after logging into DVWA.
+                  </p>
+                </div>
+              ) : (
+                <div>
+                  <div className="mb-4">
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      Authentication Types
+                    </label>
+                    <select
+                      value={customAuthType}
+                      onChange={(e) => setCustomAuthType(e.target.value as 'cookie' | 'header')}
+                      className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    >
+                      <option value="cookie">Cookie</option>
+                      <option value="header">Header</option>
+                    </select>
+                  </div>
+                  
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      {customAuthType === 'cookie' ? 'Cookie 值' : 'Headers (JSON)'}
+                    </label>
+                    <textarea
+                      value={customAuthData}
+                      onChange={(e) => setCustomAuthData(e.target.value)}
+                      placeholder={
+                        customAuthType === 'cookie'
+                          ? 'name1=value1; name2=value2'
+                          : '{"Authorization": "Bearer token"}'
+                      }
+                      className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      rows={3}
+                    />
+                  </div>
+                </div>
+              )}
+              
+              <div className="flex justify-end gap-3 mt-6">
+                <button
+                  onClick={() => setShowAuthModal(false)}
+                  className="px-4 py-2 text-gray-700 bg-gray-200 rounded-lg hover:bg-gray-300"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => setShowAuthModal(false)}
+                  className="px-4 py-2 text-white bg-blue-500 rounded-lg hover:bg-blue-600"
+                >
+                  Confirm
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Scan Controls */}
         <div className="bg-white rounded-2xl shadow-xl p-8 mb-8">

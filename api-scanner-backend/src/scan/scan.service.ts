@@ -1,11 +1,17 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { spawn, ChildProcess } from 'child_process';
 import * as path from 'path';
-import axios, { AxiosResponse } from 'axios';
+import axios, { AxiosResponse, AxiosRequestConfig } from 'axios';
 import * as cheerio from 'cheerio';
 import { ScanXSSResult } from '../dto/XSS.dto';
 import { ScanSQLInjectionResult } from '../dto/SQLInjection.dto';
 import { ScannerConfig } from '../config/scanner.config';
+
+interface AuthConfig {
+  type: 'none' | 'cookie' | 'header';
+  cookies?: Record<string, string>;
+  headers?: Record<string, string>;
+}
 
 type ScanMethod =
   | 'static'
@@ -27,6 +33,15 @@ interface ParsedResult {
   vulnerable: boolean;
   method?: string;
   error?: string;
+  parameter?: string;
+  field?: string;
+  url?: string;
+  confidence?: number;
+  severity?: string;
+  evidence?: string;
+  databaseType?: string;
+  injectionType?: string;
+  responseTime?: number;
 }
 
 interface PageForm {
@@ -47,24 +62,45 @@ interface PageForm {
 export class ScanXSSService {
   private readonly logger = new Logger(ScanXSSService.name);
 
-  async scanForXSS(url: string): Promise<ScanXSSResult[]> {
+  async scanForXSS(
+    url: string,
+    authConfig?: AuthConfig,
+  ): Promise<ScanXSSResult[]> {
     const results: ScanXSSResult[] = [];
 
     try {
+      this.logger.log(`Starting XSS scan for: ${url}`);
+
       // 1. Analyze the page to get the actual parameters and forms
-      const pageInfo = await this.analyzePage(url);
+      const pageInfo = await this.analyzePage(url, authConfig);
+      this.logger.log(
+        `Found URL params: ${JSON.stringify(pageInfo.urlParams)}`,
+      );
+      this.logger.log(`Found ${pageInfo.forms.length} forms`);
 
       // 2. Perform a static scan based on the actual parameters
-      const staticResults = await this.staticXSSCheck(url, pageInfo);
+      const staticResults = await this.staticXSSCheck(
+        url,
+        pageInfo,
+        authConfig,
+      );
       results.push(...staticResults);
+      this.logger.log(`Static scan completed: ${staticResults.length} results`);
 
       // 3. Run a Python script scan (passing parameter information)
-      const pythonResults = await this.runPythonXSSScanner(url, pageInfo);
+      const pythonResults = await this.runPythonXSSScanner(
+        url,
+        pageInfo,
+        authConfig,
+      );
       results.push(...pythonResults);
+      this.logger.log(`Python scan completed: ${pythonResults.length} results`);
 
       // 4. Deduplicate results if enabled
       if (ScannerConfig.validation.deduplicateResults) {
-        return this.deduplicateXSSResults(results);
+        const deduplicatedResults = this.deduplicateXSSResults(results);
+        this.logger.log(`Total unique results: ${deduplicatedResults.length}`);
+        return deduplicatedResults;
       }
     } catch (error) {
       this.logger.error('XSS scan failed:', error);
@@ -73,7 +109,10 @@ export class ScanXSSService {
     return results;
   }
 
-  private async analyzePage(url: string): Promise<{
+  private async analyzePage(
+    url: string,
+    authConfig?: AuthConfig,
+  ): Promise<{
     urlParams: string[];
     forms: PageForm[];
   }> {
@@ -83,17 +122,33 @@ export class ScanXSSService {
     try {
       // Extract parameters from URL
       const urlObj = new URL(url);
-      urlObj.searchParams.forEach((_, key) => {
+      urlObj.searchParams.forEach((value, key) => {
         urlParams.push(key);
+        this.logger.debug(`Found URL param: ${key}=${value}`);
       });
 
-      // Get page content
-      const response = await axios.get(url, {
+      const requestOptions: AxiosRequestConfig = {
         timeout: ScannerConfig.network.timeout,
         headers: {
           'User-Agent': 'SecurityScanner/1.0',
+          Accept:
+            'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         },
-      });
+        validateStatus: () => true, // Accept any status code
+      };
+
+      if (authConfig && requestOptions.headers) {
+        if (authConfig.type === 'cookie' && authConfig.cookies) {
+          requestOptions.headers['Cookie'] = Object.entries(authConfig.cookies)
+            .map(([key, value]) => `${key}=${value}`)
+            .join('; ');
+        } else if (authConfig.type === 'header' && authConfig.headers) {
+          Object.assign(requestOptions.headers, authConfig.headers);
+        }
+      }
+
+      // Get page content
+      const response = await axios.get(url, requestOptions);
 
       // Parse HTML with cheerio
       const $ = cheerio.load(response.data as string);
@@ -124,6 +179,7 @@ export class ScanXSSService {
 
         if (formInfo.inputs.length > 0) {
           forms.push(formInfo);
+          this.logger.debug(`Found form with ${formInfo.inputs.length} inputs`);
         }
       });
 
@@ -147,15 +203,9 @@ export class ScanXSSService {
       this.logger.warn('Page analysis failed:', error);
     }
 
-    // Add DVWA-specific parameters if none found
+    // If no parameters found, don't add defaults - let Python scanner handle it
     if (urlParams.length === 0 && forms.length === 0) {
-      if (url.includes('xss')) {
-        urlParams.push('name', 'txtName', 'mtxMessage');
-      } else if (url.includes('sqli')) {
-        urlParams.push('id', 'Submit');
-      } else {
-        urlParams.push('q', 'search', 'query', 'input', 'data');
-      }
+      this.logger.warn('No parameters or forms found in the page');
     }
 
     return { urlParams, forms };
@@ -164,6 +214,7 @@ export class ScanXSSService {
   private async staticXSSCheck(
     url: string,
     pageInfo: { urlParams: string[]; forms: PageForm[] },
+    authConfig?: AuthConfig,
   ): Promise<ScanXSSResult[]> {
     const payloads: string[] = [
       `<script>alert('XSS')</script>`,
@@ -172,6 +223,8 @@ export class ScanXSSService {
       `"><script>alert('XSS')</script>`,
       `'><script>alert('XSS')</script>`,
       `<svg onload=alert('XSS')>`,
+      `<body onload=alert('XSS')>`,
+      `<iframe src=javascript:alert('XSS')>`,
     ];
 
     const results: ScanXSSResult[] = [];
@@ -185,12 +238,16 @@ export class ScanXSSService {
           payload,
           param,
           'url_parameter',
+          authConfig,
         );
         results.push(result);
+
+        // Add small delay to avoid overwhelming the server
+        await new Promise((resolve) => setTimeout(resolve, 100));
       }
     }
 
-    // Test forms with improved logic
+    // Test forms
     for (const form of pageInfo.forms) {
       for (const input of form.inputs) {
         const maxPayloads = Math.min(
@@ -199,12 +256,13 @@ export class ScanXSSService {
         );
         for (const payload of payloads.slice(0, maxPayloads)) {
           // Check if stored XSS testing is enabled
-          if (ScannerConfig.xss.checkStoredXSS) {
+          if (ScannerConfig.xss.checkStoredXSS && form.method === 'POST') {
             const result = await this.testStoredXSS(
               url,
               form,
               input.name,
               payload,
+              authConfig,
             );
             results.push(result);
           } else {
@@ -213,9 +271,13 @@ export class ScanXSSService {
               form,
               input.name,
               payload,
+              authConfig,
             );
             results.push(result);
           }
+
+          // Add small delay
+          await new Promise((resolve) => setTimeout(resolve, 100));
         }
       }
     }
@@ -228,9 +290,10 @@ export class ScanXSSService {
     payload: string,
     parameter: string,
     method: string,
+    authConfig?: AuthConfig,
   ): Promise<ScanXSSResult> {
     try {
-      const response = await axios.get(testUrl, {
+      const requestOptions: AxiosRequestConfig = {
         timeout: ScannerConfig.network.timeout,
         maxRedirects: 5,
         headers: {
@@ -238,7 +301,20 @@ export class ScanXSSService {
         },
         maxContentLength: ScannerConfig.network.maxContentLength,
         maxBodyLength: ScannerConfig.network.maxContentLength,
-      });
+        validateStatus: () => true,
+      };
+
+      if (authConfig && requestOptions.headers) {
+        if (authConfig.type === 'cookie' && authConfig.cookies) {
+          requestOptions.headers['Cookie'] = Object.entries(authConfig.cookies)
+            .map(([key, value]) => `${key}=${value}`)
+            .join('; ');
+        } else if (authConfig.type === 'header' && authConfig.headers) {
+          Object.assign(requestOptions.headers, authConfig.headers);
+        }
+      }
+
+      const response = await axios.get(testUrl, requestOptions);
 
       const responseData = this.extractStringFromResponse(response);
       const vulnerable = this.detectXSSInResponse(responseData, payload, false);
@@ -275,6 +351,7 @@ export class ScanXSSService {
     form: PageForm,
     fieldName: string,
     payload: string,
+    authConfig?: AuthConfig,
   ): Promise<ScanXSSResult> {
     try {
       const formUrl = this.resolveUrl(baseUrl, form.action);
@@ -289,20 +366,31 @@ export class ScanXSSService {
         }
       });
 
+      const requestOptions: AxiosRequestConfig = {
+        timeout: ScannerConfig.network.timeout,
+        headers: {
+          'User-Agent': 'SecurityScanner/1.0',
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        validateStatus: () => true,
+      };
+
+      if (authConfig && requestOptions.headers) {
+        if (authConfig.type === 'cookie' && authConfig.cookies) {
+          requestOptions.headers['Cookie'] = Object.entries(authConfig.cookies)
+            .map(([key, value]) => `${key}=${value}`)
+            .join('; ');
+        } else if (authConfig.type === 'header' && authConfig.headers) {
+          Object.assign(requestOptions.headers, authConfig.headers);
+        }
+      }
+
       let response: AxiosResponse<any>;
       if (form.method === 'POST') {
-        response = await axios.post(formUrl, formData, {
-          timeout: ScannerConfig.network.timeout,
-          headers: {
-            'User-Agent': 'SecurityScanner/1.0',
-          },
-        });
+        response = await axios.post(formUrl, formData, requestOptions);
       } else {
         response = await axios.get(formUrl, {
-          timeout: ScannerConfig.network.timeout,
-          headers: {
-            'User-Agent': 'SecurityScanner/1.0',
-          },
+          ...requestOptions,
           params: formData,
         });
       }
@@ -341,10 +429,12 @@ export class ScanXSSService {
     form: PageForm,
     fieldName: string,
     payload: string,
+    authConfig?: AuthConfig,
   ): Promise<ScanXSSResult> {
     try {
       const formUrl = this.resolveUrl(baseUrl, form.action);
-      // Create unique identifier for tracking
+
+      // Create unique identifier for tracking stored XSS
       const uniqueId = `XSS_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
       const taggedPayload = payload.replace('XSS', uniqueId);
 
@@ -357,21 +447,32 @@ export class ScanXSSService {
         }
       });
 
+      const requestOptions: AxiosRequestConfig = {
+        timeout: ScannerConfig.network.timeout,
+        headers: {
+          'User-Agent': 'SecurityScanner/1.0',
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        validateStatus: () => true,
+      };
+
+      if (authConfig && requestOptions.headers) {
+        if (authConfig.type === 'cookie' && authConfig.cookies) {
+          requestOptions.headers['Cookie'] = Object.entries(authConfig.cookies)
+            .map(([key, value]) => `${key}=${value}`)
+            .join('; ');
+        } else if (authConfig.type === 'header' && authConfig.headers) {
+          Object.assign(requestOptions.headers, authConfig.headers);
+        }
+      }
+
       // 1. Submit payload
       let submitResponse: AxiosResponse<any>;
       if (form.method === 'POST') {
-        submitResponse = await axios.post(formUrl, formData, {
-          timeout: ScannerConfig.network.timeout,
-          headers: {
-            'User-Agent': 'SecurityScanner/1.0',
-          },
-        });
+        submitResponse = await axios.post(formUrl, formData, requestOptions);
       } else {
         submitResponse = await axios.get(formUrl, {
-          timeout: ScannerConfig.network.timeout,
-          headers: {
-            'User-Agent': 'SecurityScanner/1.0',
-          },
+          ...requestOptions,
           params: formData,
         });
       }
@@ -384,21 +485,39 @@ export class ScanXSSService {
         false,
       );
 
-      let detectionMethod: ScanMethod = 'form_post';
+      let detectionMethod: ScanMethod =
+        `form_${form.method.toLowerCase()}` as ScanMethod;
 
       // 3. If not reflected, check for stored XSS
       if (!vulnerable && ScannerConfig.xss.checkStoredXSS) {
+        // Wait a bit for the data to be stored
         await new Promise((resolve) =>
           setTimeout(resolve, ScannerConfig.xss.storageCheckDelay),
         );
 
-        // Re-visit the page
-        const viewResponse = await axios.get(baseUrl, {
+        const viewRequestOptions: AxiosRequestConfig = {
           timeout: ScannerConfig.network.timeout,
           headers: {
             'User-Agent': 'SecurityScanner/1.0',
           },
-        });
+          validateStatus: () => true,
+        };
+
+        if (authConfig && viewRequestOptions.headers) {
+          if (authConfig.type === 'cookie' && authConfig.cookies) {
+            viewRequestOptions.headers['Cookie'] = Object.entries(
+              authConfig.cookies,
+            )
+              .map(([key, value]) => `${key}=${value}`)
+              .join('; ');
+          } else if (authConfig.type === 'header' && authConfig.headers) {
+            Object.assign(viewRequestOptions.headers, authConfig.headers);
+          }
+        }
+
+        // Re-visit the page to check if payload was stored
+        const viewResponse = await axios.get(baseUrl, viewRequestOptions);
+
         const viewResponseData = this.extractStringFromResponse(viewResponse);
         vulnerable = this.detectXSSInResponse(
           viewResponseData,
@@ -410,19 +529,16 @@ export class ScanXSSService {
           detectionMethod = 'stored';
         }
 
-        // Check other common display pages
+        // Also check other common pages where stored content might appear
         if (!vulnerable) {
           for (const page of ScannerConfig.xss.storedXSSPages) {
             try {
               const pageUrl = new URL(page, baseUrl).toString();
-              const pageResponse = await axios.get(pageUrl, {
-                timeout: ScannerConfig.network.timeout,
-                headers: {
-                  'User-Agent': 'SecurityScanner/1.0',
-                },
-              });
+              const pageResponse = await axios.get(pageUrl, viewRequestOptions);
               const pageData = this.extractStringFromResponse(pageResponse);
-              if (pageData.includes(uniqueId)) {
+
+              // Check with stored XSS detection
+              if (this.detectXSSInResponse(pageData, taggedPayload, true)) {
                 vulnerable = true;
                 detectionMethod = 'stored';
                 break;
@@ -440,10 +556,10 @@ export class ScanXSSService {
         method: detectionMethod,
         field: fieldName,
         url: formUrl,
-        confidence: vulnerable ? 85 : 0,
+        confidence: vulnerable ? (detectionMethod === 'stored' ? 95 : 85) : 0,
         severity: vulnerable
           ? detectionMethod === 'stored'
-            ? 'critical'
+            ? 'critical' // Stored XSS is more severe
             : 'high'
           : undefined,
         evidence: vulnerable
@@ -466,71 +582,76 @@ export class ScanXSSService {
     payload: string,
     isStored: boolean = false,
   ): boolean {
-    // 1. Check if payload exists in safe contexts
-    if (ScannerConfig.validation.excludeSafeContexts) {
-      const payloadIndex = responseData.indexOf(payload);
-      if (payloadIndex === -1 && !isStored) {
-        return false;
+    // Check if response is error page
+    if (
+      responseData.includes('404 Not Found') ||
+      responseData.includes('500 Internal Server Error')
+    ) {
+      return false;
+    }
+
+    // For stored XSS, I need to look for a unique identifier
+    // rather than the exact payload, as it might be processed
+    if (isStored) {
+      // Extract unique ID from payload if it exists
+      const uniqueIdMatch = payload.match(/XSS_\d+_[a-z0-9]+/i);
+      if (uniqueIdMatch) {
+        const uniqueId = uniqueIdMatch[0];
+        // Check if the unique ID appears anywhere in the response
+        if (responseData.includes(uniqueId)) {
+          // Make sure it's in an executable context
+          if (!this.isInSafeContext(responseData, uniqueId)) {
+            return true;
+          }
+        }
       }
 
-      // Check if in safe context
-      for (const contextPattern of ScannerConfig.safeContextPatterns) {
-        const matches = Array.from(responseData.matchAll(contextPattern));
-        for (const match of matches) {
-          const matchIndex = match.index;
-          if (
-            matchIndex !== undefined &&
-            matchIndex <= payloadIndex &&
-            payloadIndex <= matchIndex + match[0].length
-          ) {
-            return false; // In safe context, not vulnerable
+      // Also check for partial matches for stored XSS
+      // Sometimes the payload is modified when stored
+      const payloadCore = payload.replace(/['"<>]/g, '');
+      if (payloadCore && responseData.includes(payloadCore)) {
+        // Check if it's in a dangerous context
+        const patterns = [
+          /<script[^>]*>.*?alert.*?<\/script>/i,
+          /on\w+\s*=.*?alert/i,
+        ];
+        for (const pattern of patterns) {
+          if (pattern.test(responseData)) {
+            return true;
           }
         }
       }
     }
 
-    // 2. Check if properly encoded
-    if (ScannerConfig.xss.encodingCheck) {
-      const encodedPayload = this.htmlEncode(payload);
-      if (
-        responseData.includes(encodedPayload) &&
-        !responseData.includes(payload)
-      ) {
-        return false; // Properly encoded, safe
-      }
-    }
-
-    // 3. Direct payload match
+    // For reflected XSS (immediate response)
+    // 1. Direct payload match
     if (responseData.includes(payload)) {
+      // Check if it's in a safe context
+      if (this.isInSafeContext(responseData, payload)) {
+        return false;
+      }
       return true;
     }
 
-    // 4. Check for dangerous patterns with context
-    const contextualPatterns = [
-      {
-        pattern: /<script[^>]*>.*?alert\s*\([^)]*\).*?<\/script>/i,
-        context: 'script',
-        requiresXSS: true,
-      },
-      {
-        pattern: /on\w+\s*=\s*["'].*?alert\s*\([^)]*\).*?["']/i,
-        context: 'event_handler',
-        requiresXSS: true,
-      },
-      {
-        pattern: /javascript:\s*alert\s*\(/i,
-        context: 'javascript_protocol',
-        requiresXSS: true,
-      },
+    // 2. Check for partial matches (payload might be modified)
+    const payloadPatterns = [
+      payload.replace(/['"]/g, ''), // Without quotes
+      payload.replace(/</g, '&lt;').replace(/>/g, '&gt;'), // HTML encoded
+      encodeURIComponent(payload), // URL encoded
     ];
 
-    for (const { pattern, requiresXSS } of contextualPatterns) {
-      const match = responseData.match(pattern);
-      if (match) {
-        // Verify it's our injection
-        if (requiresXSS && !match[0].includes('XSS')) {
-          continue;
-        }
+    for (const pattern of payloadPatterns) {
+      if (responseData.includes(pattern)) {
+        // Found encoded version - not vulnerable
+        return false;
+      }
+    }
+
+    // 3. Check for dangerous patterns that might indicate our injection worked
+    if (payload.includes('alert') && responseData.includes('alert')) {
+      // Check if it's actually executable
+      const alertPattern = /<script[^>]*>.*?alert\s*\([^)]*\).*?<\/script>/i;
+      if (alertPattern.test(responseData)) {
         return true;
       }
     }
@@ -538,24 +659,55 @@ export class ScanXSSService {
     return false;
   }
 
-  private htmlEncode(str: string): string {
-    return str
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#x27;')
-      .replace(/\//g, '&#x2F;');
+  private isInSafeContext(responseData: string, payload: string): boolean {
+    const payloadIndex = responseData.indexOf(payload);
+    if (payloadIndex === -1) return false;
+
+    // Check if in textarea
+    const textareaPattern = /<textarea[^>]*>(.*?)<\/textarea>/gis;
+    const textareaMatches = responseData.matchAll(textareaPattern);
+    for (const match of textareaMatches) {
+      if (
+        match.index !== undefined &&
+        match.index <= payloadIndex &&
+        payloadIndex <= match.index + match[0].length
+      ) {
+        return true;
+      }
+    }
+
+    // Check if in comment
+    const commentPattern = /<!--.*?-->/gs;
+    const commentMatches = responseData.matchAll(commentPattern);
+    for (const match of commentMatches) {
+      if (
+        match.index !== undefined &&
+        match.index <= payloadIndex &&
+        payloadIndex <= match.index + match[0].length
+      ) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   private extractEvidence(responseData: string, payload: string): string {
     const index = responseData.indexOf(payload);
-    if (index === -1)
-      return 'Payload not found directly but dangerous pattern detected';
+    if (index === -1) return 'Payload pattern detected but not directly found';
 
-    const start = Math.max(0, index - 30);
-    const end = Math.min(responseData.length, index + payload.length + 30);
-    return `...${responseData.substring(start, end)}...`;
+    const start = Math.max(0, index - 50);
+    const end = Math.min(responseData.length, index + payload.length + 50);
+    return `...${responseData.substring(start, end).replace(/\s+/g, ' ').trim()}...`;
+  }
+
+  private extractContext(responseData: string, payload: string): string {
+    const index = responseData.indexOf(payload);
+    if (index === -1) return '';
+
+    const start = Math.max(0, index - 100);
+    const end = Math.min(responseData.length, index + payload.length + 100);
+    return responseData.substring(start, end).replace(/\s+/g, ' ').trim();
   }
 
   private deduplicateXSSResults(results: ScanXSSResult[]): ScanXSSResult[] {
@@ -563,7 +715,7 @@ export class ScanXSSService {
 
     for (const result of results) {
       // Create unique key for deduplication
-      const key = `${result.parameter || result.field}_${result.vulnerable}_${result.method}`;
+      const key = `${result.parameter || result.field || 'unknown'}_${result.vulnerable}_${result.method}_${result.payload}`;
 
       if (!seen.has(key)) {
         seen.set(key, result);
@@ -585,30 +737,41 @@ export class ScanXSSService {
     param: string,
     payload: string,
   ): string {
-    const url = new URL(baseUrl);
-    url.searchParams.set(param, payload);
-    return url.toString();
+    try {
+      const url = new URL(baseUrl);
+      url.searchParams.set(param, payload);
+      return url.toString();
+    } catch {
+      // Fallback for invalid URLs
+      const separator = baseUrl.includes('?') ? '&' : '?';
+      return `${baseUrl}${separator}${param}=${encodeURIComponent(payload)}`;
+    }
   }
 
   private resolveUrl(baseUrl: string, relativeUrl: string): string {
     if (!relativeUrl) return baseUrl;
     if (relativeUrl.startsWith('http')) return relativeUrl;
 
-    const base = new URL(baseUrl);
-    if (relativeUrl.startsWith('/')) {
-      return `${base.protocol}//${base.host}${relativeUrl}`;
-    }
+    try {
+      const base = new URL(baseUrl);
+      if (relativeUrl.startsWith('/')) {
+        return `${base.protocol}//${base.host}${relativeUrl}`;
+      }
 
-    const basePath = base.pathname.substring(
-      0,
-      base.pathname.lastIndexOf('/') + 1,
-    );
-    return `${base.protocol}//${base.host}${basePath}${relativeUrl}`;
+      const basePath = base.pathname.substring(
+        0,
+        base.pathname.lastIndexOf('/') + 1,
+      );
+      return `${base.protocol}//${base.host}${basePath}${relativeUrl}`;
+    } catch {
+      return baseUrl;
+    }
   }
 
   private async runPythonXSSScanner(
     url: string,
     pageInfo: { urlParams: string[]; forms: PageForm[] },
+    authConfig?: AuthConfig,
   ): Promise<ScanXSSResult[]> {
     return new Promise<ScanXSSResult[]>((resolve) => {
       const pythonScriptPath = path.join(
@@ -622,6 +785,21 @@ export class ScanXSSService {
       if (pageInfo.urlParams.length > 0) {
         args.push('--params', pageInfo.urlParams.join(','));
       }
+
+      if (authConfig) {
+        if (authConfig.type === 'cookie' && authConfig.cookies) {
+          const cookieString = Object.entries(authConfig.cookies)
+            .map(([key, value]) => `${key}=${value}`)
+            .join('; ');
+          args.push('--cookies', cookieString);
+        } else if (authConfig.type === 'header' && authConfig.headers) {
+          args.push('--headers', JSON.stringify(authConfig.headers));
+        }
+      }
+
+      this.logger.debug(
+        `Running Python XSS scanner with args: ${args.join(' ')}`,
+      );
 
       const pythonProcess: ChildProcess = spawn('python3', args);
 
@@ -639,34 +817,38 @@ export class ScanXSSService {
       if (pythonProcess.stderr) {
         pythonProcess.stderr.on('data', (data: Buffer) => {
           processData.errorOutput += data.toString();
+          this.logger.debug(`Python stderr: ${data.toString()}`);
         });
       }
 
       pythonProcess.on('close', (code: number | null) => {
+        this.logger.debug(`Python process exited with code ${code}`);
+
         if (code === 0 && processData.output) {
-          const parsedResults = this.parseJsonSafely(processData.output);
-          if (parsedResults) {
-            const mappedResults = this.mapPythonResults(parsedResults);
-            resolve(mappedResults);
-            return;
+          try {
+            const parsedResults = this.parseJsonSafely(processData.output);
+            if (parsedResults) {
+              const mappedResults = this.mapPythonResults(parsedResults);
+              this.logger.debug(
+                `Python scan returned ${mappedResults.length} results`,
+              );
+              resolve(mappedResults);
+              return;
+            }
+          } catch (error) {
+            this.logger.error('Failed to parse Python output:', error);
+            this.logger.debug('Python output was:', processData.output);
           }
         }
+
         resolve([]);
       });
 
-      pythonProcess.on('error', () => {
+      pythonProcess.on('error', (error) => {
+        this.logger.error('Failed to run Python scanner:', error);
         resolve([]);
       });
     });
-  }
-
-  private extractContext(responseData: string, payload: string): string {
-    const index = responseData.indexOf(payload);
-    if (index === -1) return '';
-
-    const start = Math.max(0, index - 50);
-    const end = Math.min(responseData.length, index + payload.length + 50);
-    return responseData.substring(start, end);
   }
 
   private extractStringFromResponse(response: AxiosResponse<any>): string {
@@ -723,7 +905,8 @@ export class ScanXSSService {
           );
         });
       }
-    } catch {
+    } catch (error) {
+      this.logger.error('JSON parse error:', error);
       return null;
     }
     return null;
@@ -731,48 +914,104 @@ export class ScanXSSService {
 
   private mapPythonResults(parsedResults: ParsedResult[]): ScanXSSResult[] {
     return parsedResults.map((result: ParsedResult): ScanXSSResult => {
+      let method: ScanMethod = 'python';
+      if (result.method) {
+        const validMethods: ScanMethod[] = [
+          'static',
+          'dynamic',
+          'python',
+          'form_post',
+          'form_get',
+          'url_parameter',
+          'selenium_dynamic',
+          'stored',
+        ];
+        if (validMethods.includes(result.method as ScanMethod)) {
+          method = result.method as ScanMethod;
+        }
+      }
+
       const mappedResult: ScanXSSResult = {
         payload: String(result.payload),
         vulnerable: Boolean(result.vulnerable),
-        method: 'python',
+        method: method,
       };
 
-      if (result.error) {
-        mappedResult.error = String(result.error);
+      if (result.parameter) mappedResult.parameter = String(result.parameter);
+      if (result.field) mappedResult.field = String(result.field);
+      if (result.url) mappedResult.url = String(result.url);
+      if (result.confidence)
+        mappedResult.confidence = Number(result.confidence);
+      if (result.severity) {
+        mappedResult.severity = result.severity as
+          | 'low'
+          | 'medium'
+          | 'high'
+          | 'critical';
       }
+      if (result.evidence) mappedResult.evidence = String(result.evidence);
+      if (result.error) mappedResult.error = String(result.error);
 
       return mappedResult;
     });
   }
 }
 
-// SQL Injection Service with improvements
 @Injectable()
 export class ScanSQLiService {
   private readonly logger = new Logger(ScanSQLiService.name);
 
-  async scanForSQLi(url: string): Promise<ScanSQLInjectionResult[]> {
+  async scanForSQLi(
+    url: string,
+    authConfig?: AuthConfig,
+  ): Promise<ScanSQLInjectionResult[]> {
     const results: ScanSQLInjectionResult[] = [];
 
     try {
+      this.logger.log(`Starting SQL injection scan for: ${url}`);
+
       // 1. Analyze page to get actual parameters
-      const pageInfo = await this.analyzePage(url);
+      const pageInfo = await this.analyzePage(url, authConfig);
+      this.logger.log(
+        `Found URL params: ${JSON.stringify(pageInfo.urlParams)}`,
+      );
 
       // 2. Time-based blind injection detection with baseline
-      const timeBasedResults = await this.timeBasedSQLiCheck(url, pageInfo);
+      const timeBasedResults = await this.timeBasedSQLiCheck(
+        url,
+        pageInfo,
+        authConfig,
+      );
       results.push(...timeBasedResults);
+      this.logger.log(
+        `Time-based scan completed: ${timeBasedResults.length} results`,
+      );
 
       // 3. Error-based detection with improved patterns
-      const errorBasedResults = await this.errorBasedSQLiCheck(url, pageInfo);
+      const errorBasedResults = await this.errorBasedSQLiCheck(
+        url,
+        pageInfo,
+        authConfig,
+      );
       results.push(...errorBasedResults);
+      this.logger.log(
+        `Error-based scan completed: ${errorBasedResults.length} results`,
+      );
 
       // 4. Python sqlmap script
-      const pythonResults = await this.runPythonSQLScanner(url, pageInfo);
+      const pythonResults = await this.runPythonSQLScanner(
+        url,
+        pageInfo,
+        authConfig,
+      );
       results.push(...pythonResults);
+      this.logger.log(`Python scan completed: ${pythonResults.length} results`);
 
       // 5. Deduplicate results if enabled
       if (ScannerConfig.validation.deduplicateResults) {
-        return this.deduplicateSQLResults(results);
+        const deduplicatedResults = this.deduplicateSQLResults(results);
+        this.logger.log(`Total unique results: ${deduplicatedResults.length}`);
+        return deduplicatedResults;
       }
     } catch (error) {
       this.logger.error('SQLi scan failed:', error);
@@ -781,32 +1020,46 @@ export class ScanSQLiService {
     return results;
   }
 
-  private async analyzePage(url: string): Promise<{
+  private async analyzePage(
+    url: string,
+    authConfig?: AuthConfig,
+  ): Promise<{
     urlParams: string[];
     forms: PageForm[];
   }> {
+    // Similar implementation to XSS service
     const urlParams: string[] = [];
     const forms: PageForm[] = [];
 
     try {
-      // Extract parameters from URL
       const urlObj = new URL(url);
-      urlObj.searchParams.forEach((_, key) => {
+      urlObj.searchParams.forEach((value, key) => {
         urlParams.push(key);
+        this.logger.debug(`Found URL param: ${key}=${value}`);
       });
 
-      // Get page content
-      const response = await axios.get(url, {
+      const requestOptions: AxiosRequestConfig = {
         timeout: ScannerConfig.network.timeout,
         headers: {
           'User-Agent': 'SecurityScanner/1.0',
         },
-      });
+        validateStatus: () => true,
+      };
 
-      // Parse HTML with cheerio
+      if (authConfig && requestOptions.headers) {
+        if (authConfig.type === 'cookie' && authConfig.cookies) {
+          requestOptions.headers['Cookie'] = Object.entries(authConfig.cookies)
+            .map(([key, value]) => `${key}=${value}`)
+            .join('; ');
+        } else if (authConfig.type === 'header' && authConfig.headers) {
+          Object.assign(requestOptions.headers, authConfig.headers);
+        }
+      }
+
+      const response = await axios.get(url, requestOptions);
+
       const $ = cheerio.load(response.data as string);
 
-      // Find all forms
       $('form').each((_, form) => {
         const $form = $(form);
         const formInfo: PageForm = {
@@ -815,7 +1068,6 @@ export class ScanSQLiService {
           inputs: [],
         };
 
-        // Find all input fields
         $form.find('input, textarea, select').each((_, input) => {
           const $input = $(input);
           const name = $input.attr('name');
@@ -838,16 +1090,10 @@ export class ScanSQLiService {
       this.logger.warn('Page analysis failed:', error);
     }
 
-    // Add DVWA-specific parameters if none found
     if (urlParams.length === 0 && forms.length === 0) {
-      if (url.includes('sqli')) {
-        urlParams.push('id', 'Submit');
-      } else if (url.includes('xss')) {
-        urlParams.push('name', 'txtName');
-      } else {
-        // Common SQL injection parameters
-        urlParams.push('id', 'user_id', 'product_id', 'page', 'category');
-      }
+      this.logger.warn(
+        'No parameters or forms found for SQL injection testing',
+      );
     }
 
     return { urlParams, forms };
@@ -856,15 +1102,41 @@ export class ScanSQLiService {
   private async timeBasedSQLiCheck(
     url: string,
     pageInfo: { urlParams: string[]; forms: PageForm[] },
+    authConfig?: AuthConfig,
   ): Promise<ScanSQLInjectionResult[]> {
     const results: ScanSQLInjectionResult[] = [];
 
-    // 1. Get baseline response times
+    if (pageInfo.urlParams.length === 0) {
+      this.logger.warn('No parameters to test for time-based SQL injection');
+      return results;
+    }
+
+    const baselineRequestOptions: AxiosRequestConfig = {
+      timeout: ScannerConfig.network.timeout,
+      validateStatus: () => true,
+      headers: {
+        'User-Agent': 'SecurityScanner/1.0',
+      },
+    };
+
+    if (authConfig && baselineRequestOptions.headers) {
+      if (authConfig.type === 'cookie' && authConfig.cookies) {
+        baselineRequestOptions.headers['Cookie'] = Object.entries(
+          authConfig.cookies,
+        )
+          .map(([key, value]) => `${key}=${value}`)
+          .join('; ');
+      } else if (authConfig.type === 'header' && authConfig.headers) {
+        Object.assign(baselineRequestOptions.headers, authConfig.headers);
+      }
+    }
+
+    // Get baseline response times
     const baselineTimes: number[] = [];
     for (let i = 0; i < ScannerConfig.sql.baselineAttempts; i++) {
       try {
         const startTime = Date.now();
-        await axios.get(url, { timeout: ScannerConfig.network.timeout });
+        await axios.get(url, baselineRequestOptions);
         baselineTimes.push(Date.now() - startTime);
         await new Promise((resolve) =>
           setTimeout(resolve, ScannerConfig.sql.baselineDelay),
@@ -884,6 +1156,9 @@ export class ScanSQLiService {
     const avgBaseline =
       baselineTimes.reduce((a, b) => a + b) / baselineTimes.length;
     const maxBaseline = Math.max(...baselineTimes);
+    this.logger.debug(
+      `Baseline response time: avg=${avgBaseline}ms, max=${maxBaseline}ms`,
+    );
 
     const timeBasedPayloads: string[] = [
       `1' AND SLEEP(5)--`,
@@ -904,9 +1179,7 @@ export class ScanSQLiService {
         for (let i = 0; i < ScannerConfig.sql.testAttempts; i++) {
           try {
             const startTime = Date.now();
-            await axios.get(testUrl, {
-              timeout: ScannerConfig.network.timeout,
-            });
+            await axios.get(testUrl, baselineRequestOptions);
             const responseTime = Date.now() - startTime;
             testTimes.push(responseTime);
 
@@ -956,6 +1229,9 @@ export class ScanSQLiService {
         }
 
         results.push(result);
+
+        // Add delay between tests
+        await new Promise((resolve) => setTimeout(resolve, 500));
       }
     }
 
@@ -965,6 +1241,7 @@ export class ScanSQLiService {
   private async errorBasedSQLiCheck(
     url: string,
     pageInfo: { urlParams: string[]; forms: PageForm[] },
+    authConfig?: AuthConfig,
   ): Promise<ScanSQLInjectionResult[]> {
     const errorPayloads: string[] = [
       `'`,
@@ -978,15 +1255,36 @@ export class ScanSQLiService {
 
     const results: ScanSQLInjectionResult[] = [];
 
+    if (pageInfo.urlParams.length === 0) {
+      this.logger.warn('No parameters to test for error-based SQL injection');
+      return results;
+    }
+
+    const requestOptions: AxiosRequestConfig = {
+      timeout: ScannerConfig.network.timeout,
+      validateStatus: () => true,
+      headers: {
+        'User-Agent': 'SecurityScanner/1.0',
+      },
+    };
+
+    if (authConfig && requestOptions.headers) {
+      if (authConfig.type === 'cookie' && authConfig.cookies) {
+        requestOptions.headers['Cookie'] = Object.entries(authConfig.cookies)
+          .map(([key, value]) => `${key}=${value}`)
+          .join('; ');
+      } else if (authConfig.type === 'header' && authConfig.headers) {
+        Object.assign(requestOptions.headers, authConfig.headers);
+      }
+    }
+
     // Test each parameter
     for (const param of pageInfo.urlParams) {
       for (const payload of errorPayloads) {
         const testUrl = this.buildTestUrlWithParam(url, param, payload);
 
         try {
-          const response = await axios.get(testUrl, {
-            timeout: ScannerConfig.network.timeout,
-          });
+          const response = await axios.get(testUrl, requestOptions);
           const responseData = this.extractStringFromResponse(response);
 
           // Use improved SQL error detection
@@ -1012,6 +1310,9 @@ export class ScanSQLiService {
           }
 
           results.push(result);
+
+          // Add delay between tests
+          await new Promise((resolve) => setTimeout(resolve, 100));
         } catch (err) {
           const errorResult: ScanSQLInjectionResult = {
             payload,
@@ -1034,6 +1335,14 @@ export class ScanSQLiService {
     evidence?: string;
     confidence?: number;
   } {
+    // Check for 404/500 errors first
+    if (
+      responseData.includes('404 Not Found') ||
+      responseData.includes('500 Internal Server Error')
+    ) {
+      return { isError: false };
+    }
+
     // Precise error patterns with confidence scores
     const precisePatterns: Array<{
       db: string;
@@ -1174,7 +1483,7 @@ export class ScanSQLiService {
 
     for (const result of results) {
       // Create unique key for deduplication
-      const key = `${result.parameter}_${result.vulnerable}_${result.method}_${result.databaseType || 'unknown'}`;
+      const key = `${result.parameter || 'unknown'}_${result.vulnerable}_${result.method}_${result.databaseType || 'unknown'}_${result.payload}`;
 
       if (!seen.has(key)) {
         seen.set(key, result);
@@ -1196,14 +1505,21 @@ export class ScanSQLiService {
     param: string,
     payload: string,
   ): string {
-    const url = new URL(baseUrl);
-    url.searchParams.set(param, payload);
-    return url.toString();
+    try {
+      const url = new URL(baseUrl);
+      url.searchParams.set(param, payload);
+      return url.toString();
+    } catch {
+      // Fallback for invalid URLs
+      const separator = baseUrl.includes('?') ? '&' : '?';
+      return `${baseUrl}${separator}${param}=${encodeURIComponent(payload)}`;
+    }
   }
 
   private async runPythonSQLScanner(
     url: string,
     pageInfo: { urlParams: string[]; forms: PageForm[] },
+    authConfig?: AuthConfig,
   ): Promise<ScanSQLInjectionResult[]> {
     return new Promise<ScanSQLInjectionResult[]>((resolve) => {
       const pythonScriptPath = path.join(
@@ -1217,6 +1533,21 @@ export class ScanSQLiService {
       if (pageInfo.urlParams.length > 0) {
         args.push('--params', pageInfo.urlParams.join(','));
       }
+
+      if (authConfig) {
+        if (authConfig.type === 'cookie' && authConfig.cookies) {
+          const cookieString = Object.entries(authConfig.cookies)
+            .map(([key, value]) => `${key}=${value}`)
+            .join('; ');
+          args.push('--cookies', cookieString);
+        } else if (authConfig.type === 'header' && authConfig.headers) {
+          args.push('--headers', JSON.stringify(authConfig.headers));
+        }
+      }
+
+      this.logger.debug(
+        `Running Python SQL scanner with args: ${args.join(' ')}`,
+      );
 
       const pythonProcess: ChildProcess = spawn('python3', args);
 
@@ -1234,22 +1565,35 @@ export class ScanSQLiService {
       if (pythonProcess.stderr) {
         pythonProcess.stderr.on('data', (data: Buffer) => {
           processData.errorOutput += data.toString();
+          this.logger.debug(`Python stderr: ${data.toString()}`);
         });
       }
 
       pythonProcess.on('close', (code: number | null) => {
+        this.logger.debug(`Python process exited with code ${code}`);
+
         if (code === 0 && processData.output) {
-          const parsedResults = this.parseJsonSafely(processData.output);
-          if (parsedResults) {
-            const mappedResults = this.mapPythonSQLResults(parsedResults);
-            resolve(mappedResults);
-            return;
+          try {
+            const parsedResults = this.parseJsonSafely(processData.output);
+            if (parsedResults) {
+              const mappedResults = this.mapPythonSQLResults(parsedResults);
+              this.logger.debug(
+                `Python scan returned ${mappedResults.length} results`,
+              );
+              resolve(mappedResults);
+              return;
+            }
+          } catch (error) {
+            this.logger.error('Failed to parse Python output:', error);
+            this.logger.debug('Python output was:', processData.output);
           }
         }
+
         resolve([]);
       });
 
-      pythonProcess.on('error', () => {
+      pythonProcess.on('error', (error) => {
+        this.logger.error('Failed to run Python scanner:', error);
         resolve([]);
       });
     });
@@ -1309,7 +1653,8 @@ export class ScanSQLiService {
           );
         });
       }
-    } catch {
+    } catch (error) {
+      this.logger.error('JSON parse error:', error);
       return null;
     }
     return null;
@@ -1319,15 +1664,68 @@ export class ScanSQLiService {
     parsedResults: ParsedResult[],
   ): ScanSQLInjectionResult[] {
     return parsedResults.map((result: ParsedResult): ScanSQLInjectionResult => {
+      let method:
+        | 'time-based'
+        | 'error-based'
+        | 'boolean-based'
+        | 'union-based'
+        | 'form_post'
+        | 'form_get'
+        | 'python-sqlmap' = 'python-sqlmap';
+
+      if (result.method) {
+        const validSQLMethods = [
+          'time-based',
+          'error-based',
+          'boolean-based',
+          'union-based',
+          'form_post',
+          'form_get',
+          'python-sqlmap',
+        ];
+        if (validSQLMethods.includes(result.method)) {
+          method = result.method as typeof method;
+        }
+      }
+
       const mappedResult: ScanSQLInjectionResult = {
         payload: String(result.payload),
         vulnerable: Boolean(result.vulnerable),
-        method: 'python-sqlmap',
+        method: method,
       };
 
-      if (result.error) {
-        mappedResult.error = String(result.error);
+      if (result.parameter) mappedResult.parameter = String(result.parameter);
+      if (result.url) mappedResult.url = String(result.url);
+      if (result.confidence)
+        mappedResult.confidence = Number(result.confidence);
+      if (result.severity) {
+        mappedResult.severity = result.severity as
+          | 'low'
+          | 'medium'
+          | 'high'
+          | 'critical';
       }
+      if (result.evidence) mappedResult.evidence = String(result.evidence);
+      if (result.databaseType) {
+        mappedResult.databaseType = result.databaseType as
+          | 'mysql'
+          | 'postgresql'
+          | 'mssql'
+          | 'oracle'
+          | 'sqlite'
+          | 'unknown';
+      }
+      if (result.injectionType) {
+        mappedResult.injectionType = result.injectionType as
+          | 'numeric'
+          | 'string'
+          | 'blind'
+          | 'time-blind'
+          | 'union';
+      }
+      if (result.responseTime)
+        mappedResult.responseTime = Number(result.responseTime);
+      if (result.error) mappedResult.error = String(result.error);
 
       return mappedResult;
     });
