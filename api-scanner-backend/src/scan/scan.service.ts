@@ -6,6 +6,7 @@ import * as cheerio from 'cheerio';
 import { ScanXSSResult } from '../dto/XSS.dto';
 import { ScanSQLInjectionResult } from '../dto/SQLInjection.dto';
 import { ScannerConfig } from '../config/scanner.config';
+import * as fs from 'fs';
 
 interface AuthConfig {
   type: 'none' | 'cookie' | 'header';
@@ -775,10 +776,18 @@ export class ScanXSSService {
   ): Promise<ScanXSSResult[]> {
     return new Promise<ScanXSSResult[]>((resolve) => {
       const pythonScriptPath = path.join(
-        process.cwd(),
-        'src/scripts',
+        __dirname,
+        '..',
+        'scripts',
         'xss_scanner.py',
       );
+
+      // Check if script exists
+      if (!fs.existsSync(pythonScriptPath)) {
+        this.logger.error(`Python script not found: ${pythonScriptPath}`);
+        resolve([]);
+        return;
+      }
 
       // Pass parameter information to Python script
       const args = [pythonScriptPath, url];
@@ -1523,10 +1532,18 @@ export class ScanSQLiService {
   ): Promise<ScanSQLInjectionResult[]> {
     return new Promise<ScanSQLInjectionResult[]>((resolve) => {
       const pythonScriptPath = path.join(
-        process.cwd(),
-        'src/scripts',
+        __dirname,
+        '..',
+        'scripts',
         'sql_scanner.py',
       );
+
+      // Check if script exists
+      if (!fs.existsSync(pythonScriptPath)) {
+        this.logger.error(`Python script not found: ${pythonScriptPath}`);
+        resolve([]);
+        return;
+      }
 
       // Pass parameter information to Python script
       const args = [pythonScriptPath, url];

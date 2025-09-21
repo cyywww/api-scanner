@@ -4,40 +4,65 @@ import type { ScanResult, ScanType } from "../types/scan.types";
 const BASE_URL = "http://localhost:3000";
 
 interface AuthConfig {
-  type: 'none' | 'cookie' | 'header';
+  type: "none" | "cookie" | "header";
   cookies?: Record<string, string>;
   headers?: Record<string, string>;
 }
 
-// Scan XSS Vulnerabilities
-export const scanXSS = async (url: string, authConfig?: AuthConfig): Promise<ScanResult[]> => {
+export const scanXSS = async (
+  url: string,
+  authConfig?: AuthConfig
+): Promise<ScanResult[]> => {
   try {
-    const res = await axios.post<ScanResult[]>(`${BASE_URL}/scan/xss`, { 
+    const res = await axios.post<ScanResult[]>(`${BASE_URL}/scan/xss`, {
       url,
-      authConfig 
+      authConfig,
     });
     return res.data;
   } catch (error) {
-    console.error('XSS scan failed:', error);
-    return [];
+    console.error("XSS scan failed:", error);
+
+    const errorMessage =
+      error instanceof Error ? error.message : "XSS scan failed";
+    return [
+      {
+        payload: "Error",
+        vulnerable: false,
+        method: "error",
+        error: errorMessage,
+        url: url,
+      },
+    ];
   }
 };
 
-// Scan SQL Injection Vulnerabilities
-export const scanSQLInjection = async (url: string, authConfig?: AuthConfig): Promise<ScanResult[]> => {
+export const scanSQLInjection = async (
+  url: string,
+  authConfig?: AuthConfig
+): Promise<ScanResult[]> => {
   try {
-    const res = await axios.post<ScanResult[]>(`${BASE_URL}/scan/sql`, { 
+    const res = await axios.post<ScanResult[]>(`${BASE_URL}/scan/sql`, {
       url,
-      authConfig 
+      authConfig,
     });
     return res.data;
   } catch (error) {
-    console.error('SQL injection scan failed:', error);
-    return [];
+    console.error("SQL injection scan failed:", error);
+
+    const errorMessage =
+      error instanceof Error ? error.message : "SQL injection scan failed";
+    return [
+      {
+        payload: "Error",
+        vulnerable: false,
+        method: "error",
+        error: errorMessage,
+        url: url,
+      },
+    ];
   }
 };
 
-// Scan All Vulnerabilities at once
 export const scanAll = async (
   url: string,
   authConfig?: AuthConfig
@@ -56,7 +81,6 @@ export const scanAll = async (
   };
 };
 
-// Generic Scanning Function (Extensible to Other Scan Types)
 export const scanVulnerability = async (
   url: string,
   scanType: Exclude<ScanType, "all">,

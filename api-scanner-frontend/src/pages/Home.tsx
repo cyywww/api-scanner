@@ -208,7 +208,7 @@ export default function Home() {
                 >
                   {preset.name}
                   {key === 'dvwa' && sessionId && (
-                    <span className="block text-xs mt-1">已配置</span>
+                    <span className="block text-xs mt-1">Configured</span>
                   )}
                 </button>
               ))}
@@ -233,7 +233,7 @@ export default function Home() {
                     type="text"
                     value={sessionId}
                     onChange={(e) => setSessionId(e.target.value)}
-                    placeholder="输入您的session ID"
+                    placeholder="Enter your session ID"
                     className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
                   />
                   <p className="text-xs text-gray-500 mt-2">
@@ -258,7 +258,7 @@ export default function Home() {
                   
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-2">
-                      {customAuthType === 'cookie' ? 'Cookie 值' : 'Headers (JSON)'}
+                      {customAuthType === 'cookie' ? 'Cookie value' : 'Headers (JSON)'}
                     </label>
                     <textarea
                       value={customAuthData}
