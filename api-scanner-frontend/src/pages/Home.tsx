@@ -15,21 +15,34 @@ const PLATFORM_PRESETS = {
     type: 'none' as const,
     config: { type: 'none' as const }
   },
-  dvwa: {
-    name: 'DVWA',
-    type: 'cookie' as const,
-    config: {
-      type: 'cookie' as const,
-      cookies: {
-        'PHPSESSID': '',
-        'security': 'low'
-      }
-    }
-  },
   custom: {
     name: 'Customize',
     type: 'custom' as const,
     config: { type: 'none' as const }
+  }
+};
+
+// Cookie Preset Template
+const COOKIE_TEMPLATES = {
+  dvwa: {
+    name: 'DVWA',
+    template: 'PHPSESSID=YOUR_SESSION_ID; security=low',
+    description: 'Damn Vulnerable Web Application'
+  },
+  wordpress: {
+    name: 'WordPress',
+    template: 'wordpress_logged_in_xxx=VALUE; wp-settings-time-1=VALUE',
+    description: 'WordPress authentication'
+  },
+  laravel: {
+    name: 'Laravel',
+    template: 'laravel_session=VALUE; XSRF-TOKEN=VALUE',
+    description: 'Laravel framework'
+  },
+  generic: {
+    name: 'Generic',
+    template: 'sessionId=VALUE; authToken=VALUE',
+    description: 'Generic session cookies'
   }
 };
 
@@ -43,23 +56,18 @@ export default function Home() {
   
   const [selectedPlatform, setSelectedPlatform] = useState('none');
   const [showAuthModal, setShowAuthModal] = useState(false);
-  const [sessionId, setSessionId] = useState('');
   const [customAuthType, setCustomAuthType] = useState<'cookie' | 'header'>('cookie');
   const [customAuthData, setCustomAuthData] = useState('');
+  const [showTemplates, setShowTemplates] = useState(false);
+
+  const applyTemplate = (template: string) => {
+    setCustomAuthData(template);
+    setShowTemplates(false);
+  };
 
   const buildAuthConfig = (): AuthConfig | undefined => {
     if (selectedPlatform === 'none') {
       return undefined;
-    }
-    
-    if (selectedPlatform === 'dvwa' && sessionId) {
-      return {
-        type: 'cookie',
-        cookies: {
-          'PHPSESSID': sessionId,
-          'security': 'low'
-        }
-      };
     }
     
     if (selectedPlatform === 'custom' && customAuthData) {
@@ -144,6 +152,16 @@ export default function Home() {
   const totalVulnerabilities = xssVulnerabilities + sqlVulnerabilities;
   const hasResults = xssResults.length > 0 || sqlResults.length > 0;
 
+  const getAuthStatusText = () => {
+    if (selectedPlatform === 'none') return 'No Authentication';
+    if (selectedPlatform === 'custom') {
+      if (customAuthType === 'cookie' && customAuthData) return 'Cookie Configured';
+      if (customAuthType === 'header' && customAuthData) return 'Header Configured';
+      return 'Not Configured';
+    }
+    return 'Not Configured';
+  };
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-50 to-gray-100">
       <div className="container mx-auto px-4 py-12 max-w-7xl">
@@ -190,13 +208,13 @@ export default function Home() {
               </button>
             </div>
             
-            <div className="grid grid-cols-3 gap-4">
+            <div className="grid grid-cols-2 gap-4">
               {Object.entries(PLATFORM_PRESETS).map(([key, preset]) => (
                 <button
                   key={key}
                   onClick={() => {
                     setSelectedPlatform(key);
-                    if (key === 'dvwa' || key === 'custom') {
+                    if (key === 'custom') {
                       setShowAuthModal(true);
                     }
                   }}
@@ -207,8 +225,8 @@ export default function Home() {
                   }`}
                 >
                   {preset.name}
-                  {key === 'dvwa' && sessionId && (
-                    <span className="block text-xs mt-1">Configured</span>
+                  {key === 'custom' && (
+                    <span className="block text-xs mt-1">{getAuthStatusText()}</span>
                   )}
                 </button>
               ))}
@@ -219,59 +237,89 @@ export default function Home() {
         {/* Authentication Configuration Modal */}
         {showAuthModal && (
           <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-            <div className="bg-white rounded-xl p-6 w-full max-w-md">
+            <div className="bg-white rounded-xl p-6 w-full max-w-md max-h-[80vh] overflow-y-auto">
               <h3 className="text-lg font-semibold mb-4">
-                {selectedPlatform === 'dvwa' ? 'DVWA Authentication Configuration' : 'Customize Authentication Configuration'}
+                Authentication Configuration
               </h3>
               
-              {selectedPlatform === 'dvwa' ? (
+              <div className="mb-4">
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  Authentication Type
+                </label>
+                <select
+                  value={customAuthType}
+                  onChange={(e) => {
+                    setCustomAuthType(e.target.value as 'cookie' | 'header');
+                    setCustomAuthData('');
+                    setShowTemplates(false);
+                  }}
+                  className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                >
+                  <option value="cookie">Cookie Authentication</option>
+                  <option value="header">Header Authentication</option>
+                </select>
+              </div>
+
+              {customAuthType === 'cookie' ? (
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-2">
-                    PHPSESSID
+                    Cookie Value
                   </label>
-                  <input
-                    type="text"
-                    value={sessionId}
-                    onChange={(e) => setSessionId(e.target.value)}
-                    placeholder="Enter your session ID"
+                  <textarea
+                    value={customAuthData}
+                    onChange={(e) => setCustomAuthData(e.target.value)}
+                    placeholder="PHPSESSID=abc123; security=low"
                     className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    rows={3}
                   />
-                  <p className="text-xs text-gray-500 mt-2">
-                    Copy the value of PHPSESSID using browser's developer tools after logging into DVWA.
-                  </p>
+                  
+                  {/* Collapsible template feature */}
+                  <div className="mt-3">
+                    <button
+                      type="button"
+                      onClick={() => setShowTemplates(!showTemplates)}
+                      className="text-sm text-blue-600 hover:text-blue-800 underline focus:outline-none"
+                    >
+                      {showTemplates ? 'Hide Templates' : 'Need templates? Click to view common formats'}
+                    </button>
+                    
+                    {showTemplates && (
+                      <div className="mt-3 p-3 bg-gray-50 rounded-lg border">
+                        <p className="text-sm font-medium text-gray-700 mb-2">Select a template to quickly fill in:</p>
+                        <div className="grid grid-cols-1 gap-2">
+                          {Object.entries(COOKIE_TEMPLATES).map(([key, template]) => (
+                            <button
+                              key={key}
+                              type="button"
+                              onClick={() => applyTemplate(template.template)}
+                              className="p-2 text-left bg-white hover:bg-blue-50 rounded border transition-colors"
+                            >
+                              <div className="font-medium text-sm text-gray-900">{template.name}</div>
+                              <div className="text-xs text-gray-500 mt-1">{template.description}</div>
+                              <div className="text-xs text-gray-400 mt-1 font-mono">{template.template}</div>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                  
                 </div>
               ) : (
                 <div>
-                  <div className="mb-4">
-                    <label className="block text-sm font-medium text-gray-700 mb-2">
-                      Authentication Types
-                    </label>
-                    <select
-                      value={customAuthType}
-                      onChange={(e) => setCustomAuthType(e.target.value as 'cookie' | 'header')}
-                      className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    >
-                      <option value="cookie">Cookie</option>
-                      <option value="header">Header</option>
-                    </select>
-                  </div>
-                  
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-2">
-                      {customAuthType === 'cookie' ? 'Cookie value' : 'Headers (JSON)'}
-                    </label>
-                    <textarea
-                      value={customAuthData}
-                      onChange={(e) => setCustomAuthData(e.target.value)}
-                      placeholder={
-                        customAuthType === 'cookie'
-                          ? 'name1=value1; name2=value2'
-                          : '{"Authorization": "Bearer token"}'
-                      }
-                      className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
-                      rows={3}
-                    />
-                  </div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    Headers (JSON Format)
+                  </label>
+                  <textarea
+                    value={customAuthData}
+                    onChange={(e) => setCustomAuthData(e.target.value)}
+                    placeholder='{"Authorization": "Bearer token123", "X-API-Key": "key456"}'
+                    className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    rows={4}
+                  />
+                  <p className="text-xs text-gray-500 mt-2">
+                    <strong>Format:</strong> Valid JSON object with header names and values
+                  </p>
                 </div>
               )}
               
