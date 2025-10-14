@@ -2,6 +2,24 @@
 
 A web application vulnerability scanner that automatically detects XSS and SQL Injection vulnerabilities.
 
+## Demo
+
+### Configure Authentication Data
+
+![Configuration](assets/configure.gif)
+
+### Scan XSS Vulnerabilities
+
+![XSS](assets/XSS.gif)
+
+### Scan SQL Injection Vulnerabilities
+
+![SQL Injection](assets/SQL%20Injection.gif)
+
+### Scan All
+
+![Scan All Vulnerabilities](assets/ScanAll.gif)
+
 ## Tech Stack
 - **Frontend**: React, TypeScript, Tailwind CSS
 - **Backend**: NestJS, TypeScript, Python
@@ -26,16 +44,6 @@ A web application vulnerability scanner that automatically detects XSS and SQL I
 - **Smart Detection**: Implements confidence scoring and false positive filtering
 - **Real-time Analysis**: Concurrent scanning with progress tracking
 - **Comprehensive Reporting**: Severity classification, evidence collection, and remediation suggestions
-
-## Demo
-### Configure Authentication Data
-![Configuration](assets/configure.gif)
-### Scan XSS Vulnerabilities
-![XSS](assets/XSS.gif)
-### Scan SQL Injection Vulnerabilities
-![SQL Injection](assets/SQL%20Injection.gif)
-### Scan All
-![Scan All Vulnerabilities](assets/ScanAll.gif)
 
 ## Quick Start
 
